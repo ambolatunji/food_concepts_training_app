@@ -1,0 +1,153 @@
+import streamlit as st
+from pathlib import Path
+from core.logic import compute_next_due, file_safe_name
+from core.emailer import send_confirmation
+from core.db import (
+    get_conn, migrate, employees_by_name, insert_training, distinct_training_values
+)
+
+
+migrate()
+conn = get_conn()
+
+st.title("📥 Record Training")
+st.info("Pick your name, we'll auto-fill your details. Then choose date, title, venue, and upload evidence.")
+
+# 1) Employee Name (searchable)
+emp_names = conn.execute("""
+    SELECT DISTINCT name FROM employees
+    WHERE name IS NOT NULL AND TRIM(name)!=''
+    ORDER BY name COLLATE NOCASE
+""").fetchall()
+employee_names = [r[0] for r in emp_names]
+name = st.selectbox("Employee Name", options=employee_names, index=None, placeholder="Search your name...")
+
+# 2) Auto-populate (disambiguate duplicate names by Store -> Department)
+email = department = store = position = region = None
+emp_id = None
+
+if name:
+    matches = employees_by_name(conn, name)
+    if len(matches) == 1:
+        emp_id, _, email, department, store, position, region = matches[0]
+    elif len(matches) > 1:
+        st.warning("Multiple employees share this name. Please select your Store (and Department if needed).")
+        stores = sorted({m[4] for m in matches if m[4]})
+        sel_store = st.selectbox("Your Store", options=stores, index=None, placeholder="Search store...")
+        if sel_store:
+            subset = [m for m in matches if m[4] == sel_store]
+            if len(subset) == 1:
+                emp_id, _, email, department, store, position, region = subset[0]
+            else:
+                depts = sorted({m[3] for m in subset if m[3]})
+                sel_dept = st.selectbox("Your Department", options=depts, index=None, placeholder="Search department...")
+                if sel_dept:
+                    subset2 = [m for m in subset if m[3] == sel_dept]
+                    if subset2:
+                        emp_id, _, email, department, store, position, region = subset2[0]
+
+# 3) Show auto-filled fields (read-only)
+colA, colB = st.columns(2)
+with colA:
+    st.text_input("Department", value=department or "", disabled=True)
+    st.text_input("Position", value=position or "", disabled=True)
+    st.text_input("Work Email", value=email or "", disabled=True)
+with colB:
+    st.text_input("Store", value=store or "", disabled=True)
+    st.text_input("Region", value=region or "", disabled=True)
+
+# 4) Training Title & Venue: suggest from history, allow "Add new"
+existing_titles = distinct_training_values(conn, "training_title")
+existing_venues = distinct_training_values(conn, "training_venue")
+
+title_choice = st.selectbox("Training Title", options=["<Add new>"] + existing_titles, index=0)
+if title_choice == "<Add new>":
+    training_title = st.text_input("Enter New Training Title")
+else:
+    training_title = title_choice
+
+venue_choice = st.selectbox("Training Venue", options=["<Add new>"] + existing_venues, index=0)
+if venue_choice == "<Add new>":
+    training_venue = st.text_input("Enter New Training Venue")
+else:
+    training_venue = venue_choice
+
+# 5) Date + Evidence
+training_date = st.date_input("Training Date", value=None, format="YYYY-MM-DD")
+evidence = st.file_uploader("Upload Evidence (JPG/PNG/PDF, ≤10 MB)", type=["jpg","jpeg","png","pdf"])
+
+# 6) Submit
+if st.button("Submit Training", type="primary", use_container_width=True):
+    # validations
+    if not name:
+        st.error("Please select your name.")
+        st.stop()
+    if not emp_id:
+        st.error("We couldn't uniquely identify your record (Store/Department needed).")
+        st.stop()
+    if not training_date:
+        st.error("Please select a training date.")
+        st.stop()
+    if not training_title:
+        st.error("Please provide a Training Title.")
+        st.stop()
+    if not training_venue:
+        st.error("Please provide a Training Venue.")
+        st.stop()
+
+    tdate = training_date.isoformat()
+    next_due = compute_next_due(tdate)
+
+    # Save evidence
+    ev_path = None; ev_mime=None; ev_size=None
+    if evidence is not None:
+        if evidence.size > 10*1024*1024:
+            st.error("Evidence exceeds 10 MB.")
+            st.stop()
+        evidence_dir = Path("data") / "evidence"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = file_safe_name(f"{emp_id}_{tdate}_{evidence.name}")
+        ev_path = str(evidence_dir / safe_name)
+        with open(ev_path, "wb") as f:
+            f.write(evidence.read())
+        ev_mime = evidence.type
+        ev_size = evidence.size
+
+    insert_training(
+        conn,
+        employee_id=emp_id,
+        training_date=tdate,
+        next_due_date=next_due,
+        evidence_path=ev_path,
+        evidence_mime=ev_mime,
+        evidence_size=ev_size,
+        training_title=training_title,
+        training_venue=training_venue
+    )
+
+    # Email (if we have one)
+    subject = "Training Confirmation – Food Concepts"
+    body = f"""Dear {name},
+
+Your training dated {tdate} has been recorded.
+
+Training Title: {training_title}
+Training Venue: {training_venue}
+Next training due date: {next_due}.
+
+Department: {department}
+Store: {store}
+Position: {position}
+Region: {region}
+
+Thank you.
+"""
+    if email:
+        ok, msg = send_confirmation(email, subject, body)
+        if ok:
+            st.success(f"Training submitted. Confirmation email sent to {email}. Next due: {next_due}")
+        else:
+            st.warning(f"Training submitted, but email not sent: {msg}")
+    else:
+        st.success(f"Training submitted. (No email on file.) Next due: {next_due}")
+    st.info("If you need to update your details (Store/Department/Email), please contact HR/Admin.")

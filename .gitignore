@@ -1,0 +1,19 @@
+Ignore the 'wife' folder and all its contents
+wife/
+
+Ignore the .streamlit folder which is used by Streamlit apps
+.streamlit/
+
+Ignore all pycache folders and their contents,
+regardless of where they are in the project.
+__pycache__/
+
+Ignore specific file types
+Ignore all JSON files
+*.json
+
+Ignore all Excel files
+*.xlsx
+
+Ignore all CSV files
+*.csv
