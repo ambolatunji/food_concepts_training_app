@@ -1,10 +1,20 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from core.db import get_conn, list_trainings, trainings_summary, distinct_employee_values, distinct_training_values
-from core.db import (
-    get_conn, list_trainings, trainings_summary, distinct_employee_values, distinct_training_values
-)
+import io
+from core.db import get_conn, list_trainings, trainings_summary, distinct_employee_values, distinct_training_values, count_employees
+
+
+def to_excel_bytes(df_dict: dict, filename="export.xlsx"):
+    # df_dict = {"SheetName": dataframe, ...}
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        for sheet, df in df_dict.items():
+            # openpyxl sheet names max 31 chars
+            safe = (sheet or "Sheet")[:31]
+            df.to_excel(writer, index=False, sheet_name=safe)
+    bio.seek(0)
+    return bio.getvalue()
 
 conn = get_conn()
 st.title("📊 Dashboard")
@@ -68,6 +78,8 @@ with left:
         st.metric("Overdue", int(overdue))
         due_30 = (pd.to_datetime(df["Next Due Date"]) <= (pd.Timestamp.today().normalize()+pd.Timedelta(days=30))).sum()
         st.metric("Due in 30 days", int(due_30))
+    total_emps = count_employees(conn)
+    st.metric("Total Employees", total_emps)
 
 with right:
     if len(df)>0:
@@ -95,3 +107,156 @@ st.download_button(
     mime="text/csv",
     use_container_width=True
 )
+st.download_button(
+    "Download table (Excel)",
+    data=to_excel_bytes({"Trainings": df}),
+    file_name="trainings_filtered.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    use_container_width=True
+)
+# Per-group multi-sheet workbook (each group's rows)
+if not df.empty:
+    group_frames = {}
+    for g in df_sum[by.capitalize()].dropna().unique():
+        group_frames[str(g)] = df[df[by.capitalize()] == g]
+    if group_frames:
+        st.download_button(
+            f"Download per-{by} detail (multi-sheet Excel)",
+            data=to_excel_bytes(group_frames),
+            file_name=f"trainings_by_{by}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+st.caption(f"Total Employees (all time): {total_emps} | Trainings shown: {len(df)}")
+from datetime import date
+
+# canonical buckets for titles
+from datetime import date
+
+TITLE_BUCKETS = {
+    "food safety": "Food Safety Training",
+    "fire": "Fire Safety Training",
+    "first aid": "First Aid Training",
+    "pest": "Pest Control Training",
+    "occupational health": "Occupational Health and Safety Training",
+    "ohs": "Occupational Health and Safety Training",
+    "6s": "6S Training",
+    "water treatment": "Water Treatment Plant Training",
+}
+
+def bucket_title(title: str) -> str:
+    if not title: return ""
+    t = str(title).lower()
+    for key, canon in TITLE_BUCKETS.items():
+        if key in t:
+            return canon
+    return title
+
+def build_matrix(conn):
+    # employees (must include 'id')
+    emps = pd.read_sql_query("""
+        SELECT id, employee_code, name, store AS location, department AS division
+        FROM employees
+        WHERE deleted_at IS NULL
+        ORDER BY name COLLATE NOCASE
+    """, conn)
+
+    if emps.empty:
+        # still return empty matrix with columns
+        out = emps.copy()
+        out.insert(0, "S/N", range(1, len(out)+1))
+        out.rename(columns={
+            "employee_code": "EMPLOYEE CODE",
+            "name": "EMPLOYEE NAME",
+            "location": "LOCATION",
+            "division": "DIVISION",
+        }, inplace=True)
+        for canon in TITLE_BUCKETS.values():
+            for sub in ("DATE TRAINED","DUE DATE","NO OF DAYS PRIOR DUE DATE","STATUS"):
+                out[f"{canon} - {sub}"] = ""
+        return out
+
+    # trainings
+    trs = pd.read_sql_query("""
+        SELECT t.employee_id, t.training_date, t.next_due_date, t.training_title
+        FROM trainings t
+        JOIN employees e ON e.id=t.employee_id
+        WHERE t.deleted_at IS NULL AND e.deleted_at IS NULL
+    """, conn)
+
+    if trs.empty:
+        out = emps.copy()
+        out.insert(0, "S/N", range(1, len(out)+1))
+        out.rename(columns={
+            "employee_code": "EMPLOYEE CODE",
+            "name": "EMPLOYEE NAME",
+            "location": "LOCATION",
+            "division": "DIVISION",
+        }, inplace=True)
+        for canon in TITLE_BUCKETS.values():
+            for sub in ("DATE TRAINED","DUE DATE","NO OF DAYS PRIOR DUE DATE","STATUS"):
+                out[f"{canon} - {sub}"] = ""
+        return out
+
+    trs["bucket"] = trs["training_title"].apply(bucket_title)
+    trs["training_date"] = pd.to_datetime(trs["training_date"])
+    trs.sort_values(["employee_id","bucket","training_date"], inplace=True)
+    last = trs.groupby(["employee_id","bucket"], as_index=False).last()
+
+    today = pd.Timestamp(date.today())
+    last["next_due_date"] = pd.to_datetime(last["next_due_date"])
+    last["days_prior_due"] = (last["next_due_date"].dt.normalize() - today.normalize()).dt.days
+    last["status"] = last["days_prior_due"].apply(lambda d: "NOT DUE" if pd.notna(d) and d > 0 else "DUE")
+
+    # build per-bucket frames
+    wide = {}
+    for canon in TITLE_BUCKETS.values():
+        sub = last[last["bucket"] == canon][["employee_id","training_date","next_due_date","days_prior_due","status"]].copy()
+        sub.columns = ["employee_id",
+                       f"{canon} - DATE TRAINED",
+                       f"{canon} - DUE DATE",
+                       f"{canon} - NO OF DAYS PRIOR DUE DATE",
+                       f"{canon} - STATUS"]
+        wide[canon] = sub
+
+    out = emps.copy()
+    for canon, sub in wide.items():
+        # FIX: merge on id (left) and employee_id (right)
+        out = out.merge(sub, left_on="id", right_on="employee_id", how="left")
+        out.drop(columns=["employee_id"], inplace=True)
+
+    out.insert(0, "S/N", range(1, len(out)+1))
+    out.rename(columns={
+        "employee_code": "EMPLOYEE CODE",
+        "name": "EMPLOYEE NAME",
+        "location": "LOCATION",
+        "division": "DIVISION",
+    }, inplace=True)
+    return out
+matrix_df = build_matrix(conn)
+# --- Matrix preview (first 50 by default) ---
+st.subheader("Matrix preview")
+
+# Choose how many rows to view
+view_opt = st.radio("Rows to show", ["50", "100", "All"], horizontal=True, index=0)
+
+if view_opt == "All":
+    view_df = matrix_df
+else:
+    view_df = matrix_df.head(int(view_opt))
+
+st.dataframe(view_df, use_container_width=True, height=520)
+
+# Download exactly what's shown (Excel)
+st.download_button(
+    "Download shown (Excel)",
+    data=to_excel_bytes({"Matrix": view_df}),   # uses the helper you already added
+    file_name=f"training_matrix_{view_opt.lower()}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    use_container_width=True
+)
+
+# view the first 20 matrix
+st.caption(f"Total Employees (all time): {count_employees(conn)}")
+st.caption(f"Matrix generated on {date.today().isoformat()}")
+st.caption(f"Total Employees (all time): {total_emps} | Trainings shown: {len(df)}")

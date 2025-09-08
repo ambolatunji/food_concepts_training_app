@@ -56,6 +56,35 @@ with colB:
     st.text_input("Store", value=store or "", disabled=True)
     st.text_input("Region", value=region or "", disabled=True)
 
+with st.expander("Request a correction to your employee details"):
+    new_name = st.text_input("Corrected Name", value=name or "")
+    new_email = st.text_input("Corrected Work Email", value=email or "")
+    new_dept  = st.text_input("Corrected Department", value=department or "")
+    new_store = st.text_input("Corrected Store", value=store or "")
+    new_pos   = st.text_input("Corrected Position", value=position or "")
+    new_reg   = st.text_input("Corrected Region", value=region or "")
+
+    if st.button("Submit Correction Request", use_container_width=True):
+        if not emp_id:
+            st.error("Select your name first so we can link the request.")
+        else:
+            payload = {}
+            # only include fields that actually changed
+            if new_name and new_name != (name or ""): payload["name"] = new_name
+            if new_email != (email or ""): payload["email"] = new_email
+            if new_dept  != (department or ""): payload["department"] = new_dept
+            if new_store != (store or ""): payload["store"] = new_store
+            if new_pos   != (position or ""): payload["position"] = new_pos
+            if new_reg   != (region or ""): payload["region"] = new_reg
+
+            if not payload:
+                st.info("No changes detected.")
+            else:
+                from core.db import create_change_request
+                create_change_request(conn, emp_id, payload)
+                st.success("Correction submitted for admin approval.")
+
+
 # 4) Training Title & Venue: suggest from history, allow "Add new"
 existing_titles = distinct_training_values(conn, "training_title")
 existing_venues = distinct_training_values(conn, "training_venue")
@@ -124,6 +153,8 @@ if st.button("Submit Training", type="primary", use_container_width=True):
         training_title=training_title,
         training_venue=training_venue
     )
+
+
 
     # Email (if we have one)
     subject = "Training Confirmation – Food Concepts"

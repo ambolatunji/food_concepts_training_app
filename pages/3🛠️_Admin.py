@@ -1,15 +1,155 @@
 import streamlit as st
 import pandas as pd
 from pathlib import Path
-from core.db import get_conn, migrate, upsert_employee, find_employee_by_fields, insert_training
 from core.logic import unique_key, normalize_str, to_date_str, canonicalize, REGION_SYNONYMS
 from core.auth import build_authenticator
 from core.templates import write_employee_template, write_training_template
 from core.emailer import send_confirmation
+from pathlib import Path
+import pandas as pd
 from core.db import (
-    get_conn, migrate, upsert_employee, find_employee_by_fields, insert_training
+    get_conn, migrate, upsert_employee, find_employee_by_fields, insert_training,
+    soft_delete_training, restore_training, hard_delete_training, list_deleted_trainings,
+    soft_delete_employee, restore_employee, hard_delete_employee, list_deleted_employees,
+    list_change_requests, approve_change_request, reject_change_request,
+    soft_delete_all_trainings, restore_all_trainings, hard_delete_all_trainings,
+    soft_delete_all_employees, restore_all_employees, hard_delete_all_employees,
+    count_employees
 )
+import json
+import io
 
+def _pick(df, *options):
+    for o in options:
+        if o in df.columns: return o
+    return None
+
+def _process_employee_df(conn, df: pd.DataFrame):
+    rename = {c: c.strip().lower() for c in df.columns}
+    df.columns = [rename[c] for c in df.columns]
+    c_name = _pick(df, "employee name","name")
+    c_email= _pick(df, "email","work email")
+    c_code = _pick(df, "employee code","code")
+    c_dept = _pick(df, "department","dept")
+    c_store= _pick(df, "store","location")
+    c_pos  = _pick(df, "position","postion","postion ","postion  ")
+    c_reg  = _pick(df, "region")
+    c_start= _pick(df, "start date (yyyy-mm-dd)","start date","start_date")
+    if not all([c_name, c_dept, c_store]):
+        return 0, "Employee Name, Department, and Store columns are required."
+
+    from core.logic import normalize_str, unique_key, to_date_str
+    df["_name"]=df[c_name].astype(object).apply(normalize_str)
+    df["_email"]=df[c_email].astype(object).apply(normalize_str) if c_email else ""
+    df["_dept"]=df[c_dept].astype(object).apply(normalize_str)
+    df["_store"]=df[c_store].astype(object).apply(normalize_str)
+    df["_pos"]=df[c_pos].astype(object).apply(normalize_str) if c_pos else ""
+    df["_reg"]=df[c_reg].astype(object).apply(normalize_str) if c_reg else ""
+    df["_uk"]=df.apply(lambda r: unique_key(r["_name"], r["_email"], r["_store"], r["_dept"]), axis=1)
+    df = df.drop_duplicates(subset=["_uk"], keep="first")
+
+    cnt=0
+    for i,r in df.iterrows():
+        row = {
+            "employee_code": (df[c_code][i] if c_code in df.columns else ""),
+            "name": r["_name"],
+            "email": r["_email"] if isinstance(r["_email"], str) else "",
+            "department": r["_dept"],
+            "store": r["_store"],
+            "position": r["_pos"],
+            "region": r["_reg"],
+            "start_date": to_date_str(df[c_start][i]) if c_start in df.columns else ""
+        }
+        upsert_employee(conn, r["_uk"], row)
+        cnt+=1
+    return cnt, "OK"
+
+def _process_training_df(conn, df: pd.DataFrame):
+    rmap = {c: c.strip().lower() for c in df.columns}
+    df.columns = [rmap[c] for c in df.columns]
+    c_name = _pick(df, "employee name","name")
+    c_email= _pick(df, "email","work email")
+    c_dept = _pick(df, "department","dept")
+    c_store= _pick(df, "store","location")
+    c_titl = _pick(df, "training title","title")
+    c_venu = _pick(df, "training venue","venue")
+    c_date = _pick(df, "training date (yyyy-mm-dd)","training date","date")
+    if c_name is None or c_date is None:
+        return 0, "Need at least Employee Name and Training Date."
+
+    from core.logic import normalize_str, to_date_str, compute_next_due
+    inserted = 0
+    for _, row in df.iterrows():
+        name  = normalize_str(row[c_name]) if c_name in df.columns else ""
+        email = normalize_str(row[c_email]) if c_email in df.columns else ""
+        dept  = normalize_str(row[c_dept]) if c_dept in df.columns else ""
+        store = normalize_str(row[c_store]) if c_store in df.columns else ""
+        title = normalize_str(row[c_titl]) if c_titl in df.columns else ""
+        venue = normalize_str(row[c_venu]) if c_venu in df.columns else ""
+        tdate = to_date_str(row[c_date])
+
+        if not name or not tdate:
+            continue
+
+        # Flexible matching (email -> name+store+dept -> name+store -> name+dept -> unique name)
+        emp_row = None
+        if email:
+            cand = conn.execute("""
+                SELECT id,name,email,department,store,position,region,start_date
+                FROM employees
+                WHERE deleted_at IS NULL AND lower(email)=?
+            """, (email.lower(),)).fetchall()
+            def _eq(a,b): return a and b and a.lower()==b.lower()
+            if cand:
+                if name:  cand = [r for r in cand if _eq(r[1], name)]
+                if store: cand = [r for r in cand if _eq(r[4], store)]
+                if dept:  cand = [r for r in cand if _eq(r[3], dept)]
+                if len(cand)==1:
+                    emp_row = cand[0]
+                elif len(cand)>1:
+                    # tie-break by most recent start_date, else first
+                    from core.logic import to_date_str as _d
+                    cand = sorted(cand, key=lambda r: _d(r[7]) or "", reverse=True)
+                    emp_row = cand[0]
+        if emp_row is None and name and store and dept:
+            emp_row = conn.execute("""
+                SELECT id,name,email,department,store,position,region
+                FROM employees
+                WHERE deleted_at IS NULL AND lower(name)=? AND lower(store)=? AND lower(department)=?
+            """, (name.lower(), store.lower(), dept.lower())).fetchone()
+        if emp_row is None and name and store:
+            rows = conn.execute("""
+                SELECT id,name,email,department,store,position,region
+                FROM employees WHERE deleted_at IS NULL AND lower(name)=? AND lower(store)=?
+            """, (name.lower(), store.lower())).fetchall()
+            if len(rows)==1: emp_row = rows[0]
+        if emp_row is None and name and dept:
+            rows = conn.execute("""
+                SELECT id,name,email,department,store,position,region
+                FROM employees WHERE deleted_at IS NULL AND lower(name)=? AND lower(department)=?
+            """, (name.lower(), dept.lower())).fetchall()
+            if len(rows)==1: emp_row = rows[0]
+        if emp_row is None and name:
+            rows = conn.execute("""
+                SELECT id,name,email,department,store,position,region
+                FROM employees WHERE deleted_at IS NULL AND lower(name)=?
+            """, (name.lower(),)).fetchall()
+            if len(rows)==1: emp_row = rows[0]
+
+        if not emp_row: 
+            continue
+
+        next_due = compute_next_due(tdate)
+        insert_training(conn,
+            employee_id=emp_row[0],
+            training_date=tdate,
+            next_due_date=next_due,
+            evidence_path=None, evidence_mime=None, evidence_size=None,
+            training_title=title or None, training_venue=venue or None
+        )
+        inserted += 1
+
+    return inserted, "OK"
 
 migrate()
 conn = get_conn()
@@ -32,6 +172,46 @@ st.success(f"Logged in as {username}")
 authenticator.logout(location="sidebar", key="logout")
 if st.session_state.get("logout"):
     st.rerun()
+
+st.subheader("Auto-import from /data (runs if DB is empty)")
+
+auto_log = st.empty()
+did_anything = False
+
+try:
+    # 1) If no employees yet, try to auto-import employees
+    if count_employees(conn) == 0:
+        candidates_emp = [
+            Path("data/Employee_Upload_Template.xlsx"),
+        ] + list(Path("data").glob("Employee*.xlsx")) + list(Path("data").glob("Employees*.xlsx"))
+        for p in candidates_emp:
+            if p.exists():
+                df = pd.read_excel(p)
+                n, msg = _process_employee_df(conn, df)
+                auto_log.info(f"Imported employees from {p.name}: {n} rows ({msg})")
+                did_anything = True
+                break
+
+    # 2) If trainings table empty, try to auto-import trainings
+    cnt_trainings = conn.execute("SELECT COUNT(*) FROM trainings").fetchone()[0]
+    if cnt_trainings == 0 and count_employees(conn) > 0:
+        candidates_trn = [
+            Path("data/Training_Upload_Template.xlsx"),
+        ] + list(Path("data").glob("Training*.xlsx")) + list(Path("data").glob("Trainings*.xlsx"))
+        for p in candidates_trn:
+            if p.exists():
+                df = pd.read_excel(p)
+                n, msg = _process_training_df(conn, df)
+                auto_log.info(f"Imported trainings from {p.name}: {n} rows ({msg})")
+                did_anything = True
+                break
+except Exception as e:
+    st.warning(f"Auto-import skipped due to: {e}")
+
+if not did_anything:
+    st.caption("No matching files found in /data, or DB already contains data. You can still upload manually below.")
+else:
+    st.success("Auto-import attempt completed.")
 
 st.subheader("Download Excel Templates")
 c1, c2 = st.columns(2)
@@ -99,12 +279,127 @@ if up and st.button("Process Employee Upload", type="primary"):
         cnt+=1
     st.success(f"Processed {cnt} employee records (deduped).")
 
+st.subheader("Manage Trainings")
+# show a small recent list to act on
+recent = conn.execute("""
+    SELECT t.id, e.name, e.department, e.store, t.training_title, t.training_venue, t.training_date, t.next_due_date
+    FROM trainings t JOIN employees e ON e.id=t.employee_id
+    WHERE t.deleted_at IS NULL
+    ORDER BY date(t.training_date) DESC
+    LIMIT 200
+""").fetchall()
+df_recent = pd.DataFrame(recent, columns=["ID","Name","Department","Store","Title","Venue","Date","Next Due"])
+st.dataframe(df_recent, use_container_width=True, height=300)
+
+tid = st.number_input("Training ID to delete (soft-delete)", min_value=0, step=1)
+if st.button("Soft-delete training", use_container_width=True):
+    if tid > 0:
+        soft_delete_training(conn, int(tid))
+        st.success(f"Training {int(tid)} moved to Recycle Bin.")
+        st.rerun()
+st.subheader("Recycle Bin – Trainings")
+trash = list_deleted_trainings(conn)
+df_trash = pd.DataFrame(trash, columns=["ID","Name","Department","Store","Date","Title","Venue","Deleted At"])
+st.dataframe(df_trash, use_container_width=True, height=240)
+
+colR1, colR2 = st.columns(2)
+with colR1:
+    rid = st.number_input("Training ID to restore", min_value=0, step=1, key="restore_tid")
+    if st.button("Restore training", use_container_width=True):
+        if rid>0:
+            restore_training(conn, int(rid))
+            st.success(f"Training {int(rid)} restored.")
+            st.rerun()
+with colR2:
+    hid = st.number_input("Training ID to permanently delete", min_value=0, step=1, key="hard_tid")
+    if st.button("Permanently delete training", use_container_width=True, type="secondary"):
+        if hid>0:
+            hard_delete_training(conn, int(hid))
+            st.success(f"Training {int(hid)} permanently deleted.")
+            st.rerun()
+
+st.subheader("Danger Zone – Bulk Actions")
+
+entity = st.radio("Target", ["Trainings","Employees"], horizontal=True)
+action = st.radio("Action", ["Soft delete ALL (to Recycle Bin)","Restore ALL from Recycle Bin","Permanently delete ALL"], horizontal=False)
+confirm = st.text_input("Type YES to confirm")
+
+if st.button("Execute bulk action", type="secondary", use_container_width=True):
+    if confirm.strip().upper() != "YES":
+        st.error("Type YES to confirm.")
+    else:
+        if entity == "Trainings":
+            if action.startswith("Soft delete"): 
+                soft_delete_all_trainings(conn); st.success("All trainings soft-deleted.")
+            elif action.startswith("Restore"):
+                restore_all_trainings(conn); st.success("All trainings restored.")
+            else:
+                hard_delete_all_trainings(conn); st.success("All trainings permanently deleted.")
+        else:
+            if action.startswith("Soft delete"):
+                soft_delete_all_employees(conn); st.success("All employees soft-deleted.")
+            elif action.startswith("Restore"):
+                restore_all_employees(conn); st.success("All employees restored.")
+            else:
+                hard_delete_all_employees(conn); st.success("All employees permanently deleted (and their trainings).")
+        st.rerun()
+
+st.subheader("Correction Requests (Pending)")
+pending = list_change_requests(conn, "pending")
+dfp = pd.DataFrame(pending, columns=["ID","Employee ID","Payload JSON","Status","Created At","Decided At","Decided By"])
+st.dataframe(dfp, use_container_width=True, height=240)
+
+cc1, cc2 = st.columns(2)
+with cc1:
+    app_id = st.number_input("Request ID to approve", min_value=0, step=1)
+    if st.button("Approve request", use_container_width=True):
+        if app_id>0:
+            ok, msg = approve_change_request(conn, int(app_id), decided_by=username or "admin")
+            if ok: st.success(msg); st.rerun()
+            else: st.error(msg)
+with cc2:
+    rej_id = st.number_input("Request ID to reject", min_value=0, step=1, key="rej_id")
+    if st.button("Reject request", use_container_width=True, type="secondary"):
+        if rej_id>0:
+            reject_change_request(conn, int(rej_id), decided_by=username or "admin")
+            st.success("Rejected."); st.rerun()
+
+st.subheader("Approved Corrections (Download)")
+approved = list_change_requests(conn, "approved")
+dfa = pd.DataFrame(approved, columns=["ID","Employee ID","Payload JSON","Status","Created At","Decided At","Decided By"])
+def _explode_payload(df):
+    # turn JSON payload into columns
+    rows=[]
+    for _,r in df.iterrows():
+        payload = json.loads(r["Payload JSON"])
+        base = r.to_dict()
+        base.update(payload)
+        rows.append(base)
+    return pd.DataFrame(rows)
+
+if len(dfa)>0:
+    df_exp = _explode_payload(dfa)
+    from io import BytesIO
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+        df_exp.to_excel(xw, index=False, sheet_name="approved_updates")
+    bio.seek(0)
+    st.download_button(
+        "Download approved updates (Excel)",
+        data=bio.getvalue(),
+        file_name="approved_corrections.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+else:
+    st.caption("No approved corrections yet.")
+
 # -------- Training History Upload (bulk) --------
 st.subheader("Upload Training History (Bulk)")
 st.caption("Use Training_Upload_Template.xlsx. Only Employee Name and Training Date are strictly required. Email/Store/Department help disambiguate.")
 
 tup = st.file_uploader("Upload Training History (xlsx)", type=["xlsx"], key="training_upload")
-if tup and st.button("Process Training Upload", type="primary", width='stretch'):
+if tup and st.button("Process Training Upload", type="primary", use_container_width=True):
     import pandas as pd
     from core.logic import to_date_str, compute_next_due, normalize_str
 

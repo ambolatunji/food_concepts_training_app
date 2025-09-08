@@ -2,6 +2,7 @@ import sqlite3
 from pathlib import Path
 from typing import Iterable, List, Dict
 from datetime import datetime
+import json
 
 DB_PATH = Path("data") / "training.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -83,8 +84,27 @@ def migrate():
     );
     """)
 
+    # soft-delete columns
+    ensure_column(conn, "employees", "deleted_at", "TEXT")
+    ensure_column(conn, "trainings", "deleted_at", "TEXT")
+
+    # change requests (pending user corrections)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS change_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        employee_id INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,   -- {"name": "...", "store": "...", ...}
+        status TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | rejected
+        created_at TEXT NOT NULL,
+        decided_at TEXT,
+        decided_by TEXT,
+        FOREIGN KEY(employee_id) REFERENCES employees(id) ON DELETE CASCADE
+    );
+    """)
+
     conn.commit()
     conn.close()
+
 
 def now():
     return datetime.now().isoformat(timespec="seconds")
@@ -122,14 +142,13 @@ def upsert_employee(conn, unique_key, row: Dict):
 
 def find_employee_by_fields(conn, name:str, department:str, store:str, email:str=None):
     cur = conn.cursor()
+    base = """SELECT id,name,email,department,store,position,region
+              FROM employees
+              WHERE deleted_at IS NULL AND lower(name)=? AND lower(department)=? AND lower(store)=?"""
     if email:
-        cur.execute("""SELECT id,name,email,department,store,position,region FROM employees
-                       WHERE lower(name)=? AND lower(department)=? AND lower(store)=? AND lower(email)=?""",
-                    (name.lower().strip(), department.lower().strip(), store.lower().strip(), email.lower().strip()))
+        cur.execute(base + " AND lower(email)=?", (name.lower().strip(), department.lower().strip(), store.lower().strip(), email.lower().strip()))
     else:
-        cur.execute("""SELECT id,name,email,department,store,position,region FROM employees
-                       WHERE lower(name)=? AND lower(department)=? AND lower(store)=?""",
-                    (name.lower().strip(), department.lower().strip(), store.lower().strip()))
+        cur.execute(base, (name.lower().strip(), department.lower().strip(), store.lower().strip()))
     return cur.fetchone()
 
 def insert_training(conn, employee_id:int, training_date:str, next_due_date:str,
@@ -207,7 +226,7 @@ def distinct_employee_values(conn, col: str):
     cur.execute(f"""
         SELECT DISTINCT {col}
         FROM employees
-        WHERE {col} IS NOT NULL AND TRIM({col})!=''
+        WHERE deleted_at IS NULL AND {col} IS NOT NULL AND TRIM({col})!=''
         ORDER BY {col} COLLATE NOCASE
     """)
     return [r[0] for r in cur.fetchall()]
@@ -228,10 +247,131 @@ def employees_by_name(conn, name: str):
     cur.execute("""
         SELECT id, name, email, department, store, position, region
         FROM employees
-        WHERE lower(name)=?
+        WHERE deleted_at IS NULL AND lower(name)=?
         ORDER BY store COLLATE NOCASE, department COLLATE NOCASE
     """, (name.lower().strip(),))
     return cur.fetchall()
+
+def list_trainings(conn, filters:Dict=None):
+    filters = filters or {}
+    sql = """SELECT t.id, e.name, e.department, e.store, e.position, e.region,
+                    t.training_date, t.next_due_date, t.evidence_path,
+                    t.training_title, t.training_venue
+             FROM trainings t
+             JOIN employees e ON e.id = t.employee_id
+             WHERE t.deleted_at IS NULL AND e.deleted_at IS NULL"""
+    
+def count_employees(conn)->int:
+    return conn.execute("SELECT COUNT(*) FROM employees WHERE deleted_at IS NULL").fetchone()[0]
+
+def soft_delete_training(conn, training_id:int):
+    conn.execute("UPDATE trainings SET deleted_at=? WHERE id=?", (now(), training_id))
+    conn.commit()
+
+def restore_training(conn, training_id:int):
+    conn.execute("UPDATE trainings SET deleted_at=NULL WHERE id=?", (training_id,))
+    conn.commit()
+
+def hard_delete_training(conn, training_id:int):
+    conn.execute("DELETE FROM trainings WHERE id=?", (training_id,))
+    conn.commit()
+
+def list_deleted_trainings(conn):
+    return conn.execute("""
+        SELECT t.id, e.name, e.department, e.store, t.training_date, t.training_title, t.training_venue, t.deleted_at
+        FROM trainings t JOIN employees e ON e.id=t.employee_id
+        WHERE t.deleted_at IS NOT NULL
+        ORDER BY t.deleted_at DESC
+    """).fetchall()
+
+def soft_delete_employee(conn, employee_id:int):
+    conn.execute("UPDATE employees SET deleted_at=? WHERE id=?", (now(), employee_id))
+    conn.commit()
+
+def restore_employee(conn, employee_id:int):
+    conn.execute("UPDATE employees SET deleted_at=NULL WHERE id=?", (employee_id,))
+    conn.commit()
+
+def hard_delete_employee(conn, employee_id:int):
+    # this will also DELETE trainings via ON DELETE CASCADE if you truly delete the row
+    conn.execute("DELETE FROM employees WHERE id=?", (employee_id,))
+    conn.commit()
+
+def list_deleted_employees(conn):
+    return conn.execute("""
+        SELECT id, name, email, department, store, position, region, deleted_at
+        FROM employees
+        WHERE deleted_at IS NOT NULL
+        ORDER BY deleted_at DESC
+    """).fetchall()
+def soft_delete_all_trainings(conn):
+    conn.execute("UPDATE trainings SET deleted_at=? WHERE deleted_at IS NULL", (now(),))
+    conn.commit()
+
+def restore_all_trainings(conn):
+    conn.execute("UPDATE trainings SET deleted_at=NULL WHERE deleted_at IS NOT NULL")
+    conn.commit()
+
+def hard_delete_all_trainings(conn):
+    conn.execute("DELETE FROM trainings")
+    conn.commit()
+
+def soft_delete_all_employees(conn):
+    conn.execute("UPDATE employees SET deleted_at=? WHERE deleted_at IS NULL", (now(),))
+    conn.commit()
+
+def restore_all_employees(conn):
+    conn.execute("UPDATE employees SET deleted_at=NULL WHERE deleted_at IS NOT NULL")
+    conn.commit()
+
+def hard_delete_all_employees(conn):
+    # WARNING: this will cascade delete trainings for those employees
+    conn.execute("DELETE FROM employees")
+    conn.commit()
+
+def create_change_request(conn, employee_id:int, payload:dict):
+    conn.execute("""
+        INSERT INTO change_requests (employee_id, payload_json, status, created_at)
+        VALUES (?,?, 'pending', ?)
+    """, (employee_id, json.dumps(payload, ensure_ascii=False), now()))
+    conn.commit()
+
+def list_change_requests(conn, status:str="pending"):
+    return conn.execute("""
+        SELECT id, employee_id, payload_json, status, created_at, decided_at, decided_by
+        FROM change_requests
+        WHERE status=?
+        ORDER BY created_at DESC
+    """, (status,)).fetchall()
+
+def approve_change_request(conn, request_id:int, decided_by:str):
+    # fetch request
+    r = conn.execute("SELECT employee_id, payload_json FROM change_requests WHERE id=?", (request_id,)).fetchone()
+    if not r: return False, "Request not found"
+    employee_id, payload_json = r
+    payload = json.loads(payload_json)
+
+    # allowlist of editable fields
+    allowed = {"name","email","department","store","position","region","employee_code","start_date"}
+    updates = {k:v for k,v in payload.items() if k in allowed}
+
+    # build dynamic UPDATE
+    if updates:
+        sets = ", ".join(f"{k}=?" for k in updates.keys())
+        params = list(updates.values()) + [now(), employee_id]
+        conn.execute(f"UPDATE employees SET {sets}, updated_at=? WHERE id=?", params)
+
+    conn.execute("""
+        UPDATE change_requests SET status='approved', decided_at=?, decided_by=? WHERE id=?
+    """, (now(), decided_by, request_id))
+    conn.commit()
+    return True, "Approved"
+
+def reject_change_request(conn, request_id:int, decided_by:str):
+    conn.execute("""
+        UPDATE change_requests SET status='rejected', decided_at=?, decided_by=? WHERE id=?
+    """, (now(), decided_by, request_id))
+    conn.commit()
 
 # ---- optional (kept for backwards compatibility) ----
 def get_lookup_values(conn, kind:str)->List[str]:
