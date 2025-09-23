@@ -168,18 +168,28 @@ def list_trainings(conn, filters:Dict=None):
                     t.training_title, t.training_venue
              FROM trainings t
              JOIN employees e ON e.id = t.employee_id
-             WHERE 1=1"""
+             WHERE t.deleted_at IS NULL AND e.deleted_at IS NULL"""
     params=[]
+    # employee-dimension filters
     for k in ("department","store","position","region"):
         if filters.get(k):
             sql += f" AND lower(e.{k})=?"
             params.append(filters[k].lower())
+    # date range
     if filters.get("date_from"):
         sql += " AND date(t.training_date)>=date(?)"
         params.append(filters["date_from"])
     if filters.get("date_to"):
         sql += " AND date(t.training_date)<=date(?)"
         params.append(filters["date_to"])
+    # NEW: training title / venue filters
+    if filters.get("training_title"):
+        sql += " AND lower(t.training_title)=?"
+        params.append(filters["training_title"].lower())
+    if filters.get("training_venue"):
+        sql += " AND lower(t.training_venue)=?"
+        params.append(filters["training_venue"].lower())
+
     sql += " ORDER BY date(t.training_date) DESC"
     cur = conn.cursor()
     cur.execute(sql, params)
@@ -387,3 +397,39 @@ def seed_lookup(conn, kind:str, values:Iterable[str]):
             VALUES (?,?,?)
         """, (kind, v, v))
     conn.commit()
+
+def count_employees_matching(conn, filters:Dict=None)->int:
+    filters = filters or {}
+    sql = "SELECT COUNT(DISTINCT e.id) FROM employees e WHERE e.deleted_at IS NULL"
+    params=[]
+    for k in ("department","store","position","region"):
+        if filters.get(k):
+            sql += f" AND lower(e.{k})=?"
+            params.append(filters[k].lower())
+    return conn.execute(sql, params).fetchone()[0]
+
+def count_trained_employees(conn, filters:Dict=None)->int:
+    filters = filters or {}
+    sql = """SELECT COUNT(DISTINCT e.id)
+             FROM trainings t
+             JOIN employees e ON e.id=t.employee_id
+             WHERE t.deleted_at IS NULL AND e.deleted_at IS NULL"""
+    params=[]
+    for k in ("department","store","position","region"):
+        if filters.get(k):
+            sql += f" AND lower(e.{k})=?"
+            params.append(filters[k].lower())
+    if filters.get("date_from"):
+        sql += " AND date(t.training_date)>=date(?)"
+        params.append(filters["date_from"])
+    if filters.get("date_to"):
+        sql += " AND date(t.training_date)<=date(?)"
+        params.append(filters["date_to"])
+    if filters.get("training_title"):
+        sql += " AND lower(t.training_title)=?"
+        params.append(filters["training_title"].lower())
+    if filters.get("training_venue"):
+        sql += " AND lower(t.training_venue)=?"
+        params.append(filters["training_venue"].lower())
+    return conn.execute(sql, params).fetchone()[0]
+
