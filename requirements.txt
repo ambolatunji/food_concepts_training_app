@@ -8,3 +8,6 @@ bcrypt
 streamlit-authenticator
 python-pptx
 python-docx
+matplotlib
+openai
+
