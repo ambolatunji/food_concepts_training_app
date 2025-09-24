@@ -8,7 +8,7 @@ from core.emailer import send_confirmation
 from pathlib import Path
 import pandas as pd
 from core.db import (
-    get_conn, migrate, upsert_employee, find_employee_by_fields, insert_training,
+    get_conn, migrate, upsert_employee, find_employee_by_fields, insert_training, process_hires_df, process_leavers_df,
     soft_delete_training, restore_training, hard_delete_training, list_deleted_trainings,
     soft_delete_employee, restore_employee, hard_delete_employee, list_deleted_employees,
     list_change_requests, approve_change_request, reject_change_request,
@@ -23,6 +23,17 @@ def _pick(df, *options):
     for o in options:
         if o in df.columns: return o
     return None
+
+import io
+def to_excel_bytes(sheets: dict) -> bytes:
+    # sheets = {"SheetName": df, ...}
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+        for name, df in sheets.items():
+            safe = (name or "Sheet")[:31]
+            df.to_excel(xw, index=False, sheet_name=safe)
+    bio.seek(0)
+    return bio.getvalue()
 
 def _process_employee_df(conn, df: pd.DataFrame):
     rename = {c: c.strip().lower() for c in df.columns}
@@ -213,8 +224,64 @@ if not did_anything:
 else:
     st.success("Auto-import attempt completed.")
 
+st.caption("Scans /data for Excel files. If filename contains **hire** or **leave/leaver/resign/exit**, "
+           "it will import accordingly (fallback: header detection). Safe to run multiple times — events are deduped.")
+
+if st.button("Scan /data now", type="primary", use_container_width=True):
+    data_dir = Path("data")
+    if not data_dir.exists():
+        st.warning("No /data folder found.")
+    else:
+        total_hires = 0
+        total_leavers = 0
+        logs = []
+        files = list(data_dir.glob("*.xlsx")) + list(data_dir.glob("*.xls"))
+        for p in files:
+            try:
+                df = pd.read_excel(p)
+                cols = [c.strip().lower() for c in df.columns]
+                name = p.name.lower()
+
+                # filename clues
+                is_hire_by_name = "hire" in name
+                is_leave_by_name = any(x in name for x in ["leave","leaver","resign","exit"])
+
+                # header clues
+                has_start = any(("startdate" == c) or ("start date" in c) or ("start_date" == c) for c in cols)
+                has_end   = any(("end date" in c) or ("leaving date" in c) or ("resign" in c) or ("exit date" in c) for c in cols)
+                decided = None
+                if is_hire_by_name or (has_start and not has_end):
+                    n, msg = process_hires_df(conn, df, source_name=p.name)
+                    total_hires += n
+                    logs.append(f"✅ {p.name}: Hires imported = {n} ({msg})")
+                    decided = "hire"
+                if is_leave_by_name or has_end:
+                    n, msg = process_leavers_df(conn, df, source_name=p.name)
+                    total_leavers += n
+                    logs.append(f"✅ {p.name}: Leavers imported = {n} ({msg})")
+                    decided = "leave"
+                if decided is None:
+                    logs.append(f"⚠️ {p.name}: could not classify (no clear Start/End headers or hint in filename)")
+            except Exception as e:
+                logs.append(f"❌ {p.name}: error {e}")
+
+        st.success(f"Done. Hires: {total_hires}, Leavers: {total_leavers}")
+        with st.expander("Details"):
+            for m in logs:
+                st.write(m)
+
+
 st.subheader("Download Excel Templates")
-c1, c2 = st.columns(2)
+def build_hire_template():
+    cols = ["Employee Code","Employee Name","Department","Region","Store","Start Date (YYYY-MM-DD)","Position"]
+    df = pd.DataFrame(columns=cols)
+    return to_excel_bytes({"Hires_Template": df})
+
+def build_leaver_template():
+    cols = ["Employee Code","Employee Name","Department","Region","Store","End Date (YYYY-MM-DD)","Position","Start Date (optional)"]
+    df = pd.DataFrame(columns=cols)
+    return to_excel_bytes({"Leavers_Template": df})
+c1, c2, c3, c4 = st.columns(4)
 with c1:
     p = write_employee_template()
     st.download_button("Employee_Upload_Template.xlsx", data=open(p,"rb").read(),
@@ -223,6 +290,12 @@ with c2:
     p2 = write_training_template()
     st.download_button("Training_Upload_Template.xlsx", data=open(p2,"rb").read(),
                        file_name=p2.name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+with c3:
+    st.download_button("Hires_Upload_Template.xlsx", data=build_hire_template(),
+                       file_name="Hires_Upload_Template.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+with c4:
+    st.download_button("Leavers_Upload_Template.xlsx", data=build_leaver_template(),
+                       file_name="Leavers_Upload_Template.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 st.subheader("Upload/Refresh Employee Master")
 st.caption("De-duplicates within upload and against existing DB (normalized by Name + Email + Store + Department).")
@@ -278,121 +351,6 @@ if up and st.button("Process Employee Upload", type="primary"):
         upsert_employee(conn, r["_uk"], row)
         cnt+=1
     st.success(f"Processed {cnt} employee records (deduped).")
-
-st.subheader("Manage Trainings")
-# show a small recent list to act on
-recent = conn.execute("""
-    SELECT t.id, e.name, e.department, e.store, t.training_title, t.training_venue, t.training_date, t.next_due_date
-    FROM trainings t JOIN employees e ON e.id=t.employee_id
-    WHERE t.deleted_at IS NULL
-    ORDER BY date(t.training_date) DESC
-    LIMIT 200
-""").fetchall()
-df_recent = pd.DataFrame(recent, columns=["ID","Name","Department","Store","Title","Venue","Date","Next Due"])
-st.dataframe(df_recent, use_container_width=True, height=300)
-
-tid = st.number_input("Training ID to delete (soft-delete)", min_value=0, step=1)
-if st.button("Soft-delete training", use_container_width=True):
-    if tid > 0:
-        soft_delete_training(conn, int(tid))
-        st.success(f"Training {int(tid)} moved to Recycle Bin.")
-        st.rerun()
-st.subheader("Recycle Bin – Trainings")
-trash = list_deleted_trainings(conn)
-df_trash = pd.DataFrame(trash, columns=["ID","Name","Department","Store","Date","Title","Venue","Deleted At"])
-st.dataframe(df_trash, use_container_width=True, height=240)
-
-colR1, colR2 = st.columns(2)
-with colR1:
-    rid = st.number_input("Training ID to restore", min_value=0, step=1, key="restore_tid")
-    if st.button("Restore training", use_container_width=True):
-        if rid>0:
-            restore_training(conn, int(rid))
-            st.success(f"Training {int(rid)} restored.")
-            st.rerun()
-with colR2:
-    hid = st.number_input("Training ID to permanently delete", min_value=0, step=1, key="hard_tid")
-    if st.button("Permanently delete training", use_container_width=True, type="secondary"):
-        if hid>0:
-            hard_delete_training(conn, int(hid))
-            st.success(f"Training {int(hid)} permanently deleted.")
-            st.rerun()
-
-st.subheader("Danger Zone – Bulk Actions")
-
-entity = st.radio("Target", ["Trainings","Employees"], horizontal=True)
-action = st.radio("Action", ["Soft delete ALL (to Recycle Bin)","Restore ALL from Recycle Bin","Permanently delete ALL"], horizontal=False)
-confirm = st.text_input("Type YES to confirm")
-
-if st.button("Execute bulk action", type="secondary", use_container_width=True):
-    if confirm.strip().upper() != "YES":
-        st.error("Type YES to confirm.")
-    else:
-        if entity == "Trainings":
-            if action.startswith("Soft delete"): 
-                soft_delete_all_trainings(conn); st.success("All trainings soft-deleted.")
-            elif action.startswith("Restore"):
-                restore_all_trainings(conn); st.success("All trainings restored.")
-            else:
-                hard_delete_all_trainings(conn); st.success("All trainings permanently deleted.")
-        else:
-            if action.startswith("Soft delete"):
-                soft_delete_all_employees(conn); st.success("All employees soft-deleted.")
-            elif action.startswith("Restore"):
-                restore_all_employees(conn); st.success("All employees restored.")
-            else:
-                hard_delete_all_employees(conn); st.success("All employees permanently deleted (and their trainings).")
-        st.rerun()
-
-st.subheader("Correction Requests (Pending)")
-pending = list_change_requests(conn, "pending")
-dfp = pd.DataFrame(pending, columns=["ID","Employee ID","Payload JSON","Status","Created At","Decided At","Decided By"])
-st.dataframe(dfp, use_container_width=True, height=240)
-
-cc1, cc2 = st.columns(2)
-with cc1:
-    app_id = st.number_input("Request ID to approve", min_value=0, step=1)
-    if st.button("Approve request", use_container_width=True):
-        if app_id>0:
-            ok, msg = approve_change_request(conn, int(app_id), decided_by=username or "admin")
-            if ok: st.success(msg); st.rerun()
-            else: st.error(msg)
-with cc2:
-    rej_id = st.number_input("Request ID to reject", min_value=0, step=1, key="rej_id")
-    if st.button("Reject request", use_container_width=True, type="secondary"):
-        if rej_id>0:
-            reject_change_request(conn, int(rej_id), decided_by=username or "admin")
-            st.success("Rejected."); st.rerun()
-
-st.subheader("Approved Corrections (Download)")
-approved = list_change_requests(conn, "approved")
-dfa = pd.DataFrame(approved, columns=["ID","Employee ID","Payload JSON","Status","Created At","Decided At","Decided By"])
-def _explode_payload(df):
-    # turn JSON payload into columns
-    rows=[]
-    for _,r in df.iterrows():
-        payload = json.loads(r["Payload JSON"])
-        base = r.to_dict()
-        base.update(payload)
-        rows.append(base)
-    return pd.DataFrame(rows)
-
-if len(dfa)>0:
-    df_exp = _explode_payload(dfa)
-    from io import BytesIO
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as xw:
-        df_exp.to_excel(xw, index=False, sheet_name="approved_updates")
-    bio.seek(0)
-    st.download_button(
-        "Download approved updates (Excel)",
-        data=bio.getvalue(),
-        file_name="approved_corrections.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
-    )
-else:
-    st.caption("No approved corrections yet.")
 
 # -------- Training History Upload (bulk) --------
 st.subheader("Upload Training History (Bulk)")
@@ -604,3 +562,149 @@ Please schedule accordingly.
         if ok: sent+=1
         else: failed+=1
     st.success(f"Reminders attempted: {len(rows)}. Sent: {sent}. Failed: {failed}.")
+
+st.subheader("Upload New Hires & Leavers (two files at once)")
+st.caption("Drop both Excel files here; I’ll auto-detect which is Hires vs Leavers by headers (presence of End Date).")
+
+files = st.file_uploader("Upload files", type=["xlsx","xls"], accept_multiple_files=True, key="hires_leavers")
+if files and st.button("Process Hires/Leavers", type="primary", use_container_width=True):
+    import pandas as pd
+    total_hires=0; total_leavers=0; msgs=[]
+    for f in files:
+        try:
+            df = pd.read_excel(f)
+            cols = [c.strip().lower() for c in df.columns]
+            has_end = any(("end date" in c) or ("leaving date" in c) or ("resign" in c) or ("exit date" in c) for c in cols)
+            has_start = any(("start" in c and "date" in c) for c in cols)
+
+            if has_end:
+                n, msg = process_leavers_df(conn, df, source_name=f.name)
+                total_leavers += n; msgs.append(f"{f.name}: leavers {n} ({msg})")
+            elif has_start:
+                n, msg = process_hires_df(conn, df, source_name=f.name)
+                total_hires += n; msgs.append(f"{f.name}: hires {n} ({msg})")
+            else:
+                msgs.append(f"{f.name}: could not classify (no Start/End headers)")
+        except Exception as e:
+            msgs.append(f"{f.name}: error {e}")
+    st.success(f"Processed. Hires: {total_hires}, Leavers: {total_leavers}")
+    with st.expander("Details"):
+        for m in msgs:
+            st.write("- ", m)
+
+
+st.subheader("Manage Trainings")
+# show a small recent list to act on
+recent = conn.execute("""
+    SELECT t.id, e.name, e.department, e.store, t.training_title, t.training_venue, t.training_date, t.next_due_date
+    FROM trainings t JOIN employees e ON e.id=t.employee_id
+    WHERE t.deleted_at IS NULL
+    ORDER BY date(t.training_date) DESC
+    LIMIT 200
+""").fetchall()
+df_recent = pd.DataFrame(recent, columns=["ID","Name","Department","Store","Title","Venue","Date","Next Due"])
+st.dataframe(df_recent, use_container_width=True, height=300)
+
+tid = st.number_input("Training ID to delete (soft-delete)", min_value=0, step=1)
+if st.button("Soft-delete training", use_container_width=True):
+    if tid > 0:
+        soft_delete_training(conn, int(tid))
+        st.success(f"Training {int(tid)} moved to Recycle Bin.")
+        st.rerun()
+st.subheader("Recycle Bin – Trainings")
+trash = list_deleted_trainings(conn)
+df_trash = pd.DataFrame(trash, columns=["ID","Name","Department","Store","Date","Title","Venue","Deleted At"])
+st.dataframe(df_trash, use_container_width=True, height=240)
+
+colR1, colR2 = st.columns(2)
+with colR1:
+    rid = st.number_input("Training ID to restore", min_value=0, step=1, key="restore_tid")
+    if st.button("Restore training", use_container_width=True):
+        if rid>0:
+            restore_training(conn, int(rid))
+            st.success(f"Training {int(rid)} restored.")
+            st.rerun()
+with colR2:
+    hid = st.number_input("Training ID to permanently delete", min_value=0, step=1, key="hard_tid")
+    if st.button("Permanently delete training", use_container_width=True, type="secondary"):
+        if hid>0:
+            hard_delete_training(conn, int(hid))
+            st.success(f"Training {int(hid)} permanently deleted.")
+            st.rerun()
+
+st.subheader("Danger Zone – Bulk Actions")
+
+entity = st.radio("Target", ["Trainings","Employees"], horizontal=True)
+action = st.radio("Action", ["Soft delete ALL (to Recycle Bin)","Restore ALL from Recycle Bin","Permanently delete ALL"], horizontal=False)
+confirm = st.text_input("Type YES to confirm")
+
+if st.button("Execute bulk action", type="secondary", use_container_width=True):
+    if confirm.strip().upper() != "YES":
+        st.error("Type YES to confirm.")
+    else:
+        if entity == "Trainings":
+            if action.startswith("Soft delete"): 
+                soft_delete_all_trainings(conn); st.success("All trainings soft-deleted.")
+            elif action.startswith("Restore"):
+                restore_all_trainings(conn); st.success("All trainings restored.")
+            else:
+                hard_delete_all_trainings(conn); st.success("All trainings permanently deleted.")
+        else:
+            if action.startswith("Soft delete"):
+                soft_delete_all_employees(conn); st.success("All employees soft-deleted.")
+            elif action.startswith("Restore"):
+                restore_all_employees(conn); st.success("All employees restored.")
+            else:
+                hard_delete_all_employees(conn); st.success("All employees permanently deleted (and their trainings).")
+        st.rerun()
+
+st.subheader("Correction Requests (Pending)")
+pending = list_change_requests(conn, "pending")
+dfp = pd.DataFrame(pending, columns=["ID","Employee ID","Payload JSON","Status","Created At","Decided At","Decided By"])
+st.dataframe(dfp, use_container_width=True, height=240)
+
+cc1, cc2 = st.columns(2)
+with cc1:
+    app_id = st.number_input("Request ID to approve", min_value=0, step=1)
+    if st.button("Approve request", use_container_width=True):
+        if app_id>0:
+            ok, msg = approve_change_request(conn, int(app_id), decided_by=username or "admin")
+            if ok: st.success(msg); st.rerun()
+            else: st.error(msg)
+with cc2:
+    rej_id = st.number_input("Request ID to reject", min_value=0, step=1, key="rej_id")
+    if st.button("Reject request", use_container_width=True, type="secondary"):
+        if rej_id>0:
+            reject_change_request(conn, int(rej_id), decided_by=username or "admin")
+            st.success("Rejected."); st.rerun()
+
+st.subheader("Approved Corrections (Download)")
+approved = list_change_requests(conn, "approved")
+dfa = pd.DataFrame(approved, columns=["ID","Employee ID","Payload JSON","Status","Created At","Decided At","Decided By"])
+def _explode_payload(df):
+    # turn JSON payload into columns
+    rows=[]
+    for _,r in df.iterrows():
+        payload = json.loads(r["Payload JSON"])
+        base = r.to_dict()
+        base.update(payload)
+        rows.append(base)
+    return pd.DataFrame(rows)
+
+if len(dfa)>0:
+    df_exp = _explode_payload(dfa)
+    from io import BytesIO
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+        df_exp.to_excel(xw, index=False, sheet_name="approved_updates")
+    bio.seek(0)
+    st.download_button(
+        "Download approved updates (Excel)",
+        data=bio.getvalue(),
+        file_name="approved_corrections.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+else:
+    st.caption("No approved corrections yet.")
+

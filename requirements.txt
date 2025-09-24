@@ -6,3 +6,5 @@ openpyxl
 Pillow
 bcrypt
 streamlit-authenticator
+python-pptx
+python-docx

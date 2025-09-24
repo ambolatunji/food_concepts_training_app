@@ -7,12 +7,13 @@ from datetime import datetime, date
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Alignment, Font, Border, Side
 from openpyxl.utils import get_column_letter
-
 from core.db import (
     get_conn, list_trainings, trainings_summary,
     distinct_employee_values, distinct_training_values,
-    count_employees, count_employees_matching, count_trained_employees
+    count_employees, count_employees_matching, count_trained_employees,
+    count_joins, count_leaves, turnover_rate, employees_due_flags
 )
+
 
 # Canonical buckets (must match your title bucketing)
 TITLE_BUCKETS = {
@@ -65,6 +66,12 @@ def _matrix_base(conn) -> pd.DataFrame:
         JOIN employees e ON e.id=t.employee_id
         WHERE t.deleted_at IS NULL AND e.deleted_at IS NULL
     """, conn)
+    hires = pd.read_sql_query("""
+        SELECT employee_id, MAX(event_date) AS hire_date
+        FROM employment_events
+        WHERE event_type='hire'
+        GROUP BY employee_id
+    """, conn)
 
     if trs.empty:
         out = emps.copy()
@@ -99,7 +106,34 @@ def _matrix_base(conn) -> pd.DataFrame:
             out.drop(columns=["employee_id"], inplace=True)
 
     out.insert(0, "S/N", range(1, len(out)+1))
-    out.drop(columns=["id"], inplace=True, errors="ignore")
+    out = out.merge(hires, left_on="id", right_on="employee_id", how="left")  # hire_date per employee (NaN if not a new hire)
+    today = pd.Timestamp(pd.Timestamp.today().date())
+
+    # probation window = 183 days
+    hire_dt = pd.to_datetime(out["hire_date"], errors="coerce")
+    on_probation = (today - hire_dt.dt.normalize()).dt.days < 183
+    # Important: ONLY rows with a hire_date count as "new hire". If no hire_date → NOT on probation.
+    on_probation = on_probation & hire_dt.notna()
+
+    for canon in COLOR_MAP.keys():
+        dcol = f"{canon} - DATE TRAINED"
+        ncol = f"{canon} - DUE DATE"
+        pcol = f"{canon} - NO OF DAYS PRIOR DUE DATE"
+        scol = f"{canon} - STATUS"
+        if dcol in out.columns:
+            # Missing training date?
+            mask_missing = out[dcol].isna()
+            # We fill 1900-01-01 for everyone missing EXCEPT employees currently on probation
+            apply_mask = mask_missing & (~on_probation)
+            out.loc[apply_mask, dcol] = pd.Timestamp("1900-01-01")
+            out.loc[apply_mask, ncol] = today            # due now
+            out.loc[apply_mask, pcol] = 0
+            out.loc[apply_mask, scol] = "DUE"
+
+    # cleanup helper columns
+    for c in ("employee_id", "hire_date"):
+        if c in out.columns:
+            out.drop(columns=[c], inplace=True, errors="ignore")
     return out
 
 def build_matrix_multiindex(conn) -> pd.DataFrame:
@@ -272,6 +306,161 @@ def to_excel_bytes(df_dict: dict, filename="export.xlsx"):
             df.to_excel(writer, index=False, sheet_name=safe)
     bio.seek(0)
     return bio.getvalue()
+def to_excel_bytes(sheets: dict) -> bytes:
+    """sheets={'SheetName': df, ...} → Excel bytes"""
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+        for name, df in sheets.items():
+            df.to_excel(xw, index=False, sheet_name=(name or "Sheet")[:31])
+    bio.seek(0)
+    return bio.getvalue()
+
+def get_trainings_df(conn, filters:dict) -> pd.DataFrame:
+    rows = list_trainings(conn, filters)
+    df = pd.DataFrame(rows, columns=[
+        "Training ID","Employee Name","Department","Store","Position","Region",
+        "Training Date","Next Due Date","Evidence Path","Training Title","Training Venue"
+    ])
+    if not df.empty:
+        df["Training Date"] = pd.to_datetime(df["Training Date"], errors="coerce")
+        df["Next Due Date"] = pd.to_datetime(df["Next Due Date"], errors="coerce")
+    return df
+
+def get_employees_df(conn, filters:dict) -> pd.DataFrame:
+    sql = """SELECT id, name, department, store, position, region, start_date, end_date
+             FROM employees WHERE deleted_at IS NULL"""
+    args=[]
+    for k in ("department","store","position","region"):
+        if filters.get(k):
+            sql += f" AND lower({k})=?"; args.append(filters[k].lower())
+    return pd.read_sql_query(sql, conn, params=args)
+
+def chart_trainings_by_department(df):
+    if df.empty: return None, pd.DataFrame()
+    g = df.groupby("Department")["Training ID"].count().reset_index(name="Trainings").sort_values("Trainings", ascending=False)
+    fig = px.bar(g, x="Department", y="Trainings", title="Trainings by Department")
+    fig.update_layout(margin=dict(l=30,r=10,b=120,t=60), xaxis_tickangle=-45)
+    return fig, g
+
+def chart_trainings_by_title(df):
+    if df.empty: return None, pd.DataFrame()
+    g = df.groupby("Training Title")["Training ID"].count().reset_index(name="Trainings").sort_values("Trainings", ascending=False)
+    fig = px.bar(g, x="Training Title", y="Trainings", title="Trainings by Title")
+    fig.update_layout(margin=dict(l=30,r=10,b=160,t=60), xaxis_tickangle=-45)
+    return fig, g
+
+def chart_trainings_by_month(df):
+    if df.empty: return None, pd.DataFrame()
+    d = df.dropna(subset=["Training Date"]).copy()
+    if d.empty: return None, pd.DataFrame()
+    d["Month"] = d["Training Date"].dt.to_period("M").astype(str)
+    g = d.groupby("Month")["Training ID"].count().reset_index(name="Trainings")
+    fig = px.line(g, x="Month", y="Trainings", title="Training Trend by Month", markers=True)
+    fig.update_layout(margin=dict(l=30,r=10,b=80,t=60))
+    return fig, g
+
+def chart_region_pie(df):
+    if df.empty: return None, pd.DataFrame()
+    g = df.groupby("Region")["Training ID"].count().reset_index(name="Trainings")
+    if g.empty: return None, g
+    fig = px.pie(g, names="Region", values="Trainings", title="Trainings Share by Region", hole=0.35)
+    fig.update_layout(margin=dict(l=10,r=10,b=10,t=60))
+    return fig, g
+
+def chart_top_stores(df, topn=20):
+    if df.empty: return None, pd.DataFrame()
+    g = df.groupby("Store")["Training ID"].count().reset_index(name="Trainings").sort_values("Trainings", ascending=False).head(topn)
+    fig = px.bar(g, x="Store", y="Trainings", title=f"Top {topn} Stores by Trainings")
+    fig.update_layout(margin=dict(l=30,r=10,b=200,t=60), xaxis_tickangle=-65)
+    return fig, g
+
+def chart_heat_dept_month(df):
+    if df.empty or "Training Date" not in df.columns: return None, pd.DataFrame()
+    d = df.dropna(subset=["Training Date"]).copy()
+    if d.empty: return None, pd.DataFrame()
+    d["Month"] = d["Training Date"].dt.to_period("M").astype(str)
+    pvt = d.pivot_table(index="Department", columns="Month", values="Training ID", aggfunc="count", fill_value=0)
+    if pvt.empty: return None, pvt
+    fig = px.imshow(pvt, aspect="auto", title="Heatmap: Trainings by Department × Month", color_continuous_scale="Blues")
+    fig.update_layout(margin=dict(l=40,r=20,b=120,t=60), xaxis_tickangle=-45)
+    return fig, pvt.reset_index()
+
+def chart_stacked_titles_by_dept(df, top_titles=6):
+    if df.empty: return None, pd.DataFrame()
+    top = df["Training Title"].value_counts().head(top_titles).index.tolist()
+    d = df[df["Training Title"].isin(top)]
+    if d.empty: return None, pd.DataFrame()
+    g = d.groupby(["Department","Training Title"])["Training ID"].count().reset_index(name="Trainings")
+    fig = px.bar(g, x="Department", y="Trainings", color="Training Title", barmode="stack",
+                 title=f"Stacked Trainings by Department (Top {top_titles} Titles)")
+    fig.update_layout(margin=dict(l=30,r=10,b=160,t=60), xaxis_tickangle=-45)
+    return fig, g
+
+def chart_coverage_by_department(conn, df, filters):
+    emps = get_employees_df(conn, filters)
+    if emps.empty:
+        cov = pd.DataFrame(columns=["Department","Headcount","Trained","Coverage"])
+        return None, cov
+    head = emps.groupby("department")["id"].nunique().reset_index(name="Headcount")
+    if df.empty:
+        cov = head.assign(Trained=0, Coverage=0.0)
+    else:
+        trained = df.groupby("Department")["Employee Name"].nunique().reset_index(name="Trained")
+        cov = head.merge(trained, left_on="department", right_on="Department", how="left").fillna({"Trained":0})
+        cov["Coverage"] = (cov["Trained"]/cov["Headcount"]*100.0).round(1)
+    cov.rename(columns={"department":"Department"}, inplace=True)
+    if cov.empty: return None, cov
+    fig = px.bar(cov.sort_values("Coverage", ascending=False), x="Department", y="Coverage", title="Coverage by Department (%)")
+    fig.update_layout(margin=dict(l=30,r=10,b=160,t=60), xaxis_tickangle=-45, yaxis_range=[0,100])
+    return fig, cov
+
+def chart_due_overdue_by_dept(conn, filters):
+    emps = get_employees_df(conn, filters)[["id","department"]].rename(columns={"department":"Department"})
+    if emps.empty: return None, pd.DataFrame()
+    fl = employees_due_flags(conn, filters)
+    if not fl:
+        g = emps.assign(**{"Due≤30d":0, "Overdue":0}).groupby("Department")[["Due≤30d","Overdue"]].sum().reset_index()
+    else:
+        fdf = pd.DataFrame([{"id":k, **v} for k,v in fl.items()])
+        base = emps.merge(fdf, on="id", how="left").fillna({"any_due_30":0,"any_overdue":0})
+        g = base.groupby("Department")[["any_due_30","any_overdue"]].sum().reset_index().rename(
+            columns={"any_due_30":"Due≤30d","any_overdue":"Overdue"})
+    fig = px.bar(g.sort_values("Due≤30d", ascending=False), x="Department", y=["Due≤30d","Overdue"],
+                 barmode="stack", title="Due vs Overdue by Department")
+    fig.update_layout(margin=dict(l=30,r=10,b=160,t=60), xaxis_tickangle=-45)
+    return fig, g
+
+def chart_treemap_store_coverage(conn, df, filters):
+    emps = get_employees_df(conn, filters)[["id","region","store"]]
+    if emps.empty: return None, pd.DataFrame()
+    head = emps.groupby(["region","store"])["id"].nunique().reset_index(name="Headcount")
+    if df.empty:
+        cov = head.assign(Trained=0, Coverage=0.0)
+    else:
+        trained = df.groupby("Store")["Employee Name"].nunique().reset_index(name="Trained")
+        cov = head.merge(trained, left_on="store", right_on="Store", how="left").fillna({"Trained":0})
+        cov["Coverage"] = (cov["Trained"]/cov["Headcount"]*100.0).round(1)
+    cov.rename(columns={"region":"Region","store":"Store"}, inplace=True)
+    if cov.empty: return None, cov
+    fig = px.treemap(cov, path=["Region","Store"], values="Headcount",
+                     color="Coverage", color_continuous_scale="RdYlGn",
+                     title="Store Coverage Treemap (size = headcount, color = coverage%)")
+    fig.update_layout(margin=dict(l=10,r=10,b=10,t=60))
+    return fig, cov
+
+def chart_joins_vs_leaves_by_month(conn, filters, date_from:str=None, date_to:str=None):
+    emp = get_employees_df(conn, filters)[["start_date","end_date"]].copy()
+    if emp.empty: return None, pd.DataFrame()
+    emp["start_date"] = pd.to_datetime(emp["start_date"], errors="coerce")
+    emp["end_date"]   = pd.to_datetime(emp["end_date"], errors="coerce")
+    if date_from: emp = emp[(emp["start_date"].isna()) | (emp["start_date"]>=pd.to_datetime(date_from))]
+    if date_to:   emp = emp[(emp["start_date"].isna()) | (emp["start_date"]<=pd.to_datetime(date_to))]
+    j = emp.dropna(subset=["start_date"]).assign(Month=lambda d: d["start_date"].dt.to_period("M").astype(str)).groupby("Month").size().reset_index(name="Joins")
+    l = emp.dropna(subset=["end_date"]).assign(Month=lambda d: d["end_date"].dt.to_period("M").astype(str)).groupby("Month").size().reset_index(name="Leaves")
+    g = pd.merge(j, l, on="Month", how="outer").fillna(0).sort_values("Month")
+    fig = px.bar(g, x="Month", y=["Joins","Leaves"], barmode="group", title="Joins vs Leaves by Month")
+    fig.update_layout(margin=dict(l=30,r=10,b=80,t=60))
+    return fig, g
 
 conn = get_conn()
 st.title("📊 Dashboard")
@@ -322,17 +511,26 @@ df = pd.DataFrame(rows, columns=[
     "Training Date","Next Due Date","Evidence Path","Training Title","Training Venue"
 ])
 
-# --- KPI cards (now fully filtered) ---
-total_emps = count_employees(conn)                         # overall
-total_emps_filtered = count_employees_matching(conn, filters)  # filtered by dims
-trained_emps = count_trained_employees(conn, filters)          # filtered by dims + date + title + venue
+# --- KPIs (fully filter-aware) ---
+total_emps_all = count_employees(conn)
+total_emps_filtered = count_employees_matching(conn, filters)
+trained_emps = count_trained_employees(conn, filters)              # has at least one training in scope
 total_trainings = len(df)
 
-overdue = int((pd.to_datetime(df["Next Due Date"]) < pd.Timestamp.today().normalize()).sum()) if not df.empty else 0
-due_30  = int((pd.to_datetime(df["Next Due Date"]) <= (pd.Timestamp.today().normalize()+pd.Timedelta(days=30))).sum()) if not df.empty else 0
+# Due flags (probation-aware + “at least one training due” semantics)
+flags = employees_due_flags(conn, filters)
+any_due_30 = sum(1 for v in flags.values() if v["any_due_30"])
+any_overdue = sum(1 for v in flags.values() if v["any_overdue"])
 coverage = (trained_emps / total_emps_filtered * 100.0) if total_emps_filtered else 0.0
 
-# simple card styling
+# Joins/Leaves counters for selected date range (if none, default to “this year”)
+from datetime import date
+dfrom = filters.get("date_from") or f"{date.today().year}-01-01"
+dto   = filters.get("date_to") or date.today().isoformat()
+joins  = count_joins(conn, dfrom, dto, filters)
+leaves = count_leaves(conn, dfrom, dto, filters)
+tvr    = turnover_rate(conn, dfrom, dto, filters)
+
 st.markdown("""
 <style>
 .kpi {border-radius:16px; padding:16px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12);}
@@ -342,17 +540,14 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-kc1, kc2, kc3, kc4, kc5 = st.columns(5)
-#with kc1:
-    #st.markdown(f'<div class="kpi"><h3>Total Trainings</h3><p>{total_trainings}</p></div>', unsafe_allow_html=True)
-with kc2:
-    st.markdown(f'<div class="kpi"><h3>Total Employees (filtered)</h3><p>{total_emps_filtered}</p><small>Overall: {total_emps}</small></div>', unsafe_allow_html=True)
-with kc3:
-    st.markdown(f'<div class="kpi"><h3>Employees Trained</h3><p>{trained_emps}</p></div>', unsafe_allow_html=True)
-with kc4:
-    st.markdown(f'<div class="kpi"><h3>Coverage</h3><p>{coverage:.1f}%</p></div>', unsafe_allow_html=True)
-with kc5:
-    st.markdown(f'<div class="kpi"><h3>Due / 30d</h3><p>{due_30}</p><small>Overdue: {overdue}</small></div>', unsafe_allow_html=True)
+kc1, kc2, kc3, kc4, kc5, kc6 = st.columns(6)
+with kc1: st.markdown(f'<div class="kpi"><h3>Total Trainings</h3><p>{total_trainings}</p></div>', unsafe_allow_html=True)
+with kc2: st.markdown(f'<div class="kpi"><h3>Total Employees (filtered)</h3><p>{total_emps_filtered}</p><small>Overall: {total_emps_all}</small></div>', unsafe_allow_html=True)
+with kc3: st.markdown(f'<div class="kpi"><h3>Employees Trained</h3><p>{trained_emps}</p><small>≥ 1 training</small></div>', unsafe_allow_html=True)
+with kc4: st.markdown(f'<div class="kpi"><h3>Coverage</h3><p>{coverage:.1f}%</p></div>', unsafe_allow_html=True)
+with kc5: st.markdown(f'<div class="kpi"><h3>Due ≤ 30d</h3><p>{any_due_30}</p><small>Overdue: {any_overdue}</small></div>', unsafe_allow_html=True)
+with kc6: st.markdown(f'<div class="kpi"><h3>Joins / Leaves</h3><p>{joins} / {leaves}</p><small>Turnover: {tvr:.1f}%</small></div>', unsafe_allow_html=True)
+
 #fig2 = px.bar(df, x=by.capitalize(), y="Trainings", title=f"Trainings by {by.capitalize()} (filtered)")
 
 # Client-side filter for title/venue (simpler than altering SQL)
@@ -360,7 +555,6 @@ if f_title!="All":
     df = df[df["Training Title"]==f_title]
 if f_venue!="All":
     df = df[df["Training Venue"]==f_venue]
-
 
 st.subheader("Breakdown")
 by = st.selectbox("Group by", ["department","store","region","position","training_title","training_venue"], index=0)
@@ -371,6 +565,50 @@ if len(df_sum)>0:
     title = f"Trainings by {by.capitalize()} (filtered)"
     st.plotly_chart(fig2, use_container_width=True)
 st.dataframe(df, use_container_width=True)
+
+st.subheader("Turnover analysis")
+grp = st.selectbox("Group turnover by", ["Month","Department","Store","Region"], index=0)
+import pandas as pd
+
+def _month(s): 
+    return pd.to_datetime(s).dt.to_period("M").astype(str)
+
+# Build mini tables
+joins_df = pd.read_sql_query("""
+    SELECT name, department, store, region, start_date AS date
+    FROM employees
+    WHERE deleted_at IS NULL AND start_date IS NOT NULL
+""", conn)
+leaves_df = pd.read_sql_query("""
+    SELECT name, department, store, region, end_date AS date
+    FROM employees
+    WHERE deleted_at IS NULL AND end_date IS NOT NULL
+""", conn)
+
+# Apply dimension filters
+for k in ("department","store","region"):
+    if filters.get(k):
+        if not joins_df.empty:  joins_df = joins_df[joins_df[k].str.lower()==filters[k].lower()]
+        if not leaves_df.empty: leaves_df = leaves_df[leaves_df[k].str.lower()==filters[k].lower()]
+
+if not joins_df.empty:  joins_df["date"]  = pd.to_datetime(joins_df["date"])
+if not leaves_df.empty: leaves_df["date"] = pd.to_datetime(leaves_df["date"])
+
+if grp=="Month":
+    if not joins_df.empty:  joins_tab = joins_df.assign(Month=_month(joins_df["date"])).groupby("Month").size().reset_index(name="Joins")
+    else: joins_tab = pd.DataFrame(columns=["Month","Joins"])
+    if not leaves_df.empty: leaves_tab = leaves_df.assign(Month=_month(leaves_df["date"])).groupby("Month").size().reset_index(name="Leaves")
+    else: leaves_tab = pd.DataFrame(columns=["Month","Leaves"])
+    turn_tab = pd.merge(joins_tab, leaves_tab, on="Month", how="outer").fillna(0).sort_values("Month")
+    st.dataframe(turn_tab, use_container_width=True)
+else:
+    key = grp.lower()
+    if not joins_df.empty:  joins_tab = joins_df.groupby(key).size().reset_index(name="Joins")
+    else: joins_tab = pd.DataFrame(columns=[key,"Joins"])
+    if not leaves_df.empty: leaves_tab = leaves_df.groupby(key).size().reset_index(name="Leaves")
+    else: leaves_tab = pd.DataFrame(columns=[key,"Leaves"])
+    turn_tab = pd.merge(joins_tab, leaves_tab, on=key, how="outer").fillna(0).sort_values(key)
+    st.dataframe(turn_tab, use_container_width=True)
 
 st.download_button(
     "Download table (CSV)",
@@ -399,7 +637,7 @@ if not df.empty:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
-st.caption(f"Total Employees (all time): {total_emps} | Trainings shown: {len(df)}")
+st.caption(f"Total Employees (all time): {total_emps_all} | Trainings shown: {len(df)}")
 from datetime import date
 
 # canonical buckets for titles
@@ -425,3 +663,117 @@ st.download_button(
     use_container_width=True
 )
 st.caption(f"Matrix generated on {date.today().isoformat()}")
+
+st.header("📈 Interactive Analytics")
+
+# Pull filtered datasets once
+df_tr = get_trainings_df(conn, filters)
+df_emps = get_employees_df(conn, filters)
+
+tabs = st.tabs([
+    "Dept", "Title", "Trend", "Coverage", "Due/Overdue",
+    "Region", "Stores", "Heatmap", "Stacked Titles", "Joins vs Leaves", "Treemap"
+])
+
+with tabs[0]:
+    fig, data = chart_trainings_by_department(df_tr)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True, height=480)
+        st.download_button("Download data (Excel)", data=to_excel_bytes({"Trainings by Department": data}),
+                           file_name="trainings_by_department.xlsx", use_container_width=True)
+    else:
+        st.info("No data to display.")
+
+with tabs[1]:
+    fig, data = chart_trainings_by_title(df_tr)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True, height=480)
+        st.download_button("Download data (Excel)", data=to_excel_bytes({"Trainings by Title": data}),
+                           file_name="trainings_by_title.xlsx", use_container_width=True)
+    else:
+        st.info("No data to display.")
+
+with tabs[2]:
+    fig, data = chart_trainings_by_month(df_tr)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True, height=420)
+        st.download_button("Download data (Excel)", data=to_excel_bytes({"Trainings by Month": data}),
+                           file_name="trainings_by_month.xlsx", use_container_width=True)
+    else:
+        st.info("No data to display.")
+
+with tabs[3]:
+    fig, data = chart_coverage_by_department(conn, df_tr, filters)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True, height=480)
+        st.download_button("Download data (Excel)", data=to_excel_bytes({"Coverage by Department": data}),
+                           file_name="coverage_by_department.xlsx", use_container_width=True)
+    else:
+        st.info("No data to display.")
+
+with tabs[4]:
+    fig, data = chart_due_overdue_by_dept(conn, filters)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True, height=480)
+        st.download_button("Download data (Excel)", data=to_excel_bytes({"Due vs Overdue by Department": data}),
+                           file_name="due_overdue_by_department.xlsx", use_container_width=True)
+    else:
+        st.info("No data to display.")
+
+with tabs[5]:
+    fig, data = chart_region_pie(df_tr)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True, height=480)
+        st.download_button("Download data (Excel)", data=to_excel_bytes({"Trainings by Region": data}),
+                           file_name="trainings_by_region.xlsx", use_container_width=True)
+    else:
+        st.info("No data to display.")
+
+with tabs[6]:
+    topn = st.slider("Top stores", min_value=5, max_value=50, value=20, step=1)
+    fig, data = chart_top_stores(df_tr, topn=topn)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True, height=520)
+        st.download_button("Download data (Excel)", data=to_excel_bytes({"Top Stores": data}),
+                           file_name="top_stores.xlsx", use_container_width=True)
+    else:
+        st.info("No data to display.")
+
+with tabs[7]:
+    fig, data = chart_heat_dept_month(df_tr)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True, height=520)
+        st.download_button("Download data (Excel)", data=to_excel_bytes({"Dept x Month Heatmap": data}),
+                           file_name="dept_month_heatmap.xlsx", use_container_width=True)
+    else:
+        st.info("No data to display.")
+
+with tabs[8]:
+    k = st.slider("Top training titles", min_value=3, max_value=10, value=6, step=1)
+    fig, data = chart_stacked_titles_by_dept(df_tr, top_titles=k)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True, height=520)
+        st.download_button("Download data (Excel)", data=to_excel_bytes({"Stacked Titles by Dept": data}),
+                           file_name="stacked_titles_by_dept.xlsx", use_container_width=True)
+    else:
+        st.info("No data to display.")
+
+with tabs[9]:
+    dfrom = filters.get("date_from") or f"{date.today().year}-01-01"
+    dto   = filters.get("date_to") or date.today().isoformat()
+    fig, data = chart_joins_vs_leaves_by_month(conn, filters, date_from=dfrom, date_to=dto)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True, height=440)
+        st.download_button("Download data (Excel)", data=to_excel_bytes({"Joins vs Leaves by Month": data}),
+                           file_name="joins_vs_leaves_by_month.xlsx", use_container_width=True)
+    else:
+        st.info("No data to display.")
+
+with tabs[10]:
+    fig, data = chart_treemap_store_coverage(conn, df_tr, filters)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True, height=520)
+        st.download_button("Download data (Excel)", data=to_excel_bytes({"Store Coverage": data}),
+                           file_name="store_coverage.xlsx", use_container_width=True)
+    else:
+        st.info("No data to display.")

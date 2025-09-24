@@ -16,6 +16,7 @@ Welcome! Use the sidebar to navigate:
 - **📥 Record Training** – staff submit training attendance and upload evidence.
 - **📊 Dashboard** – view training summaries and download reports.
 - **🛠️ Admin** – upload/clean employee master, dedupe, configure, and manage records (login required).
+- **📑 Reporting** – generate PowerPoint/PDF reports (login required).
 """)
 
 st.caption(f"Local time: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
