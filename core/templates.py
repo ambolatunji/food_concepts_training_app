@@ -25,6 +25,7 @@ def write_training_template()->Path:
         "Email": "",
         "Department": "",
         "Store": "",
+        "Region": "",
         "Training Title": "",
         "Training Venue": "",
         "Training Date (YYYY-MM-DD)": "",

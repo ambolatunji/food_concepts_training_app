@@ -1,5 +1,6 @@
 Ignore the 'wife' folder and all its contents
 wife/
+wifee/
 
 Ignore the .streamlit folder which is used by Streamlit apps
 .streamlit/

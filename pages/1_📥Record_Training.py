@@ -3,7 +3,8 @@ from pathlib import Path
 from core.logic import compute_next_due, file_safe_name
 from core.emailer import send_confirmation
 from core.db import (
-    get_conn, migrate, employees_by_name, insert_training, distinct_training_values
+    get_conn, migrate, employees_by_name, insert_training, distinct_training_values,
+    get_employee_training_history
 )
 
 
@@ -55,6 +56,65 @@ with colA:
 with colB:
     st.text_input("Store", value=store or "", disabled=True)
     st.text_input("Region", value=region or "", disabled=True)
+
+# Display Training History
+if emp_id:
+    st.markdown("---")
+    st.subheader("📚 Your Training History")
+
+    training_history = get_employee_training_history(conn, emp_id)
+
+    if training_history:
+        import pandas as pd
+        from datetime import date
+
+        # Convert to DataFrame for better display
+        history_df = pd.DataFrame(training_history, columns=[
+            'Training Title', 'Training Date', 'Next Due Date', 'Days Until Due', 'Training Venue', 'Status'
+        ])
+
+        # Convert dates to more readable format
+        history_df['Training Date'] = pd.to_datetime(history_df['Training Date']).dt.strftime('%Y-%m-%d')
+        history_df['Next Due Date'] = pd.to_datetime(history_df['Next Due Date']).dt.strftime('%Y-%m-%d')
+
+        # Style the dataframe with colors based on status
+        def color_status(val):
+            if val == 'Overdue':
+                return 'background-color: #ffcccc; color: #cc0000; font-weight: bold'
+            elif val == 'Due Soon (≤30 days)':
+                return 'background-color: #fff4cc; color: #cc8800; font-weight: bold'
+            elif val == 'Due Today':
+                return 'background-color: #ffe6cc; color: #cc4400; font-weight: bold'
+            else:
+                return 'background-color: #ccffcc; color: #006600'
+
+        styled_df = history_df.style.applymap(color_status, subset=['Status'])
+
+        # Display with metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            total_trainings = len(history_df)
+            st.metric("Total Trainings Completed", total_trainings)
+        with col2:
+            overdue_count = len(history_df[history_df['Status'] == 'Overdue'])
+            st.metric("Overdue Trainings", overdue_count, delta=None if overdue_count == 0 else -overdue_count, delta_color="inverse")
+        with col3:
+            due_soon_count = len(history_df[history_df['Status'] == 'Due Soon (≤30 days)'])
+            st.metric("Due Soon", due_soon_count, delta=None if due_soon_count == 0 else -due_soon_count, delta_color="inverse")
+
+        st.dataframe(styled_df, use_container_width=True, height=min(400, (len(history_df) + 1) * 35 + 38))
+
+        # Show eligibility message
+        if overdue_count > 0:
+            st.warning(f"⚠️ You have {overdue_count} overdue training(s). Please schedule a refresher training soon.")
+        elif due_soon_count > 0:
+            st.info(f"ℹ️ You have {due_soon_count} training(s) due within 30 days. Plan ahead for your next training.")
+        else:
+            st.success("✅ All your trainings are up to date! Great job!")
+    else:
+        st.info("No training records found. This will be your first training entry.")
+
+    st.markdown("---")
 
 with st.expander("Request a correction to your employee details"):
     new_name = st.text_input("Corrected Name", value=name or "")

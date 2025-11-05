@@ -10,4 +10,5 @@ python-pptx
 python-docx
 matplotlib
 openai
-
+reportlab
+seaborn

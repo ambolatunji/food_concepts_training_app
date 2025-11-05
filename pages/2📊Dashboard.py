@@ -11,8 +11,14 @@ from core.db import (
     get_conn, list_trainings, trainings_summary,
     distinct_employee_values, distinct_training_values,
     count_employees, count_employees_matching, count_trained_employees,
-    count_joins, count_leaves, turnover_rate, employees_due_flags
+    count_joins, count_leaves, turnover_rate, employees_due_flags,
+    training_frequency_report, stores_trained_count, stores_pending_training,
+    staff_eligible_for_training, staff_participated_in_training,
+    staff_yet_to_be_trained, trainings_pending_count, food_handlers_report,
+    trained_employees_who_left,
+    REQUIRED_TRAININGS
 )
+from core.report_generator import create_pptx_report, create_word_report, create_pdf_report
 
 
 # Canonical buckets (must match your title bucketing)
@@ -367,6 +373,13 @@ def chart_region_pie(df):
     fig.update_layout(margin=dict(l=10,r=10,b=10,t=60))
     return fig, g
 
+def chart_trainings_by_region(df):
+    if df.empty: return None, pd.DataFrame()
+    g = df.groupby("Region")["Training ID"].count().reset_index(name="Trainings").sort_values("Trainings", ascending=False)
+    fig = px.bar(g, x="Region", y="Trainings", title="Trainings by Region", text="Trainings")
+    fig.update_layout(margin=dict(l=30,r=10,b=120,t=60), xaxis_tickangle=-45)
+    return fig, g
+
 def chart_top_stores(df, topn=20):
     if df.empty: return None, pd.DataFrame()
     g = df.groupby("Store")["Training ID"].count().reset_index(name="Trainings").sort_values("Trainings", ascending=False).head(topn)
@@ -408,6 +421,9 @@ def chart_coverage_by_department(conn, df, filters):
         trained = df.groupby("Department")["Employee Name"].nunique().reset_index(name="Trained")
         cov = head.merge(trained, left_on="department", right_on="Department", how="left").fillna({"Trained":0})
         cov["Coverage"] = (cov["Trained"]/cov["Headcount"]*100.0).round(1)
+        # Drop the redundant Department column from merge, keep department
+        if "Department" in cov.columns and "department" in cov.columns:
+            cov = cov.drop(columns=["Department"])
     cov.rename(columns={"department":"Department"}, inplace=True)
     if cov.empty: return None, cov
     fig = px.bar(cov.sort_values("Coverage", ascending=False), x="Department", y="Coverage", title="Coverage by Department (%)")
@@ -440,6 +456,9 @@ def chart_treemap_store_coverage(conn, df, filters):
         trained = df.groupby("Store")["Employee Name"].nunique().reset_index(name="Trained")
         cov = head.merge(trained, left_on="store", right_on="Store", how="left").fillna({"Trained":0})
         cov["Coverage"] = (cov["Trained"]/cov["Headcount"]*100.0).round(1)
+        # Drop redundant Store column from merge
+        if "Store" in cov.columns and "store" in cov.columns:
+            cov = cov.drop(columns=["Store"])
     cov.rename(columns={"region":"Region","store":"Store"}, inplace=True)
     if cov.empty: return None, cov
     fig = px.treemap(cov, path=["Region","Store"], values="Headcount",
@@ -512,16 +531,20 @@ df = pd.DataFrame(rows, columns=[
 ])
 
 # --- KPIs (fully filter-aware) ---
-total_emps_all = count_employees(conn)
+# Total = Master + Hires + Leavers
+# Active = Master + Hires - Leavers
+total_emps_all = count_employees(conn, active_only=False)
+active_emps_all = count_employees(conn, active_only=True)
 total_emps_filtered = count_employees_matching(conn, filters)
-trained_emps = count_trained_employees(conn, filters)              # has at least one training in scope
+trained_emps = count_trained_employees(conn, filters, active_only=True)  # Count only active employees trained
 total_trainings = len(df)
 
-# Due flags (probation-aware + “at least one training due” semantics)
+# Due flags (probation-aware + "at least one training due" semantics)
 flags = employees_due_flags(conn, filters)
 any_due_30 = sum(1 for v in flags.values() if v["any_due_30"])
 any_overdue = sum(1 for v in flags.values() if v["any_overdue"])
-coverage = (trained_emps / total_emps_filtered * 100.0) if total_emps_filtered else 0.0
+# Coverage = Trained Active Employees / Total Active Employees
+coverage = (trained_emps / active_emps_all * 100.0) if active_emps_all else 0.0
 
 # Joins/Leaves counters for selected date range (if none, default to “this year”)
 from datetime import date
@@ -542,9 +565,9 @@ st.markdown("""
 
 kc1, kc2, kc3, kc4, kc5, kc6 = st.columns(6)
 with kc1: st.markdown(f'<div class="kpi"><h3>Total Trainings</h3><p>{total_trainings}</p></div>', unsafe_allow_html=True)
-with kc2: st.markdown(f'<div class="kpi"><h3>Total Employees (filtered)</h3><p>{total_emps_filtered}</p><small>Overall: {total_emps_all}</small></div>', unsafe_allow_html=True)
-with kc3: st.markdown(f'<div class="kpi"><h3>Employees Trained</h3><p>{trained_emps}</p><small>≥ 1 training</small></div>', unsafe_allow_html=True)
-with kc4: st.markdown(f'<div class="kpi"><h3>Coverage</h3><p>{coverage:.1f}%</p></div>', unsafe_allow_html=True)
+with kc2: st.markdown(f'<div class="kpi"><h3>Active Employees</h3><p>{active_emps_all}</p><small>Total: {total_emps_all}</small></div>', unsafe_allow_html=True)
+with kc3: st.markdown(f'<div class="kpi"><h3>Employees Trained</h3><p>{trained_emps}</p><small>Active only</small></div>', unsafe_allow_html=True)
+with kc4: st.markdown(f'<div class="kpi"><h3>Coverage</h3><p>{coverage:.1f}%</p><small>Trained/Active</small></div>', unsafe_allow_html=True)
 with kc5: st.markdown(f'<div class="kpi"><h3>Due ≤ 30d</h3><p>{any_due_30}</p><small>Overdue: {any_overdue}</small></div>', unsafe_allow_html=True)
 with kc6: st.markdown(f'<div class="kpi"><h3>Joins / Leaves</h3><p>{joins} / {leaves}</p><small>Turnover: {tvr:.1f}%</small></div>', unsafe_allow_html=True)
 
@@ -663,6 +686,769 @@ st.download_button(
     use_container_width=True
 )
 st.caption(f"Matrix generated on {date.today().isoformat()}")
+
+# ---- NEW COMPREHENSIVE REPORTS SECTION ----
+st.header("📋 Comprehensive Reports")
+st.caption("Detailed analytics and insights for training management")
+
+# Year selector for reports
+report_year = st.selectbox("Select Year for Reports",
+                           options=list(range(date.today().year, date.today().year - 5, -1)),
+                           index=0)
+
+# Download Full Comprehensive Report Section
+st.markdown("### 📥 Download Full Comprehensive Report")
+st.caption("Download all reports below in PowerPoint, Word, or PDF format")
+
+col_dl1, col_dl2, col_dl3 = st.columns(3)
+
+# Prepare report data for all formats
+def prepare_report_data():
+    freq_data = training_frequency_report(conn, year=report_year, filters=filters)
+    freq_df = pd.DataFrame(freq_data, columns=["Training Title", "Times Held", "All Dates", "First Date", "Last Date"]) if freq_data else pd.DataFrame()
+
+    stores_trained = stores_trained_count(conn, year=report_year, filters=filters)
+    stores_pending = stores_pending_training(conn, year=report_year, filters=filters)
+    total_stores_count = stores_trained + stores_pending
+
+    eligible = staff_eligible_for_training(conn, filters)
+    participated = staff_participated_in_training(conn, year=report_year, filters=filters)
+    not_participated = eligible - participated
+
+    food_report = food_handlers_report(conn, filters)
+    pending_count = trainings_pending_count(conn, filters)
+
+    # Fix: Get total trainings for the year, not from filtered df
+    total_trainings = conn.execute("""
+        SELECT COUNT(*) FROM trainings t
+        JOIN employees e ON e.id = t.employee_id
+        WHERE t.deleted_at IS NULL
+          AND e.deleted_at IS NULL
+          AND strftime('%Y', t.training_date) = ?
+    """, (str(report_year),)).fetchone()[0]
+
+    # Staff counts: Active vs Total
+    total_staff = count_employees(conn, active_only=False)  # Total = Master + Hires + Leavers
+    active_staff = count_employees(conn, active_only=True)  # Active = Master + Hires - Leavers
+    staff_trained = count_trained_employees(conn, filters, active_only=True)  # Only active trained
+
+    # Get compliance data
+    compliance_data = []
+    for training_title in REQUIRED_TRAININGS:
+        training_count = conn.execute("""
+            SELECT COUNT(DISTINCT t.employee_id)
+            FROM trainings t
+            JOIN employees e ON e.id = t.employee_id
+            WHERE t.deleted_at IS NULL
+              AND e.deleted_at IS NULL
+              AND (e.end_date IS NULL OR date(e.end_date) > date('now'))
+              AND lower(t.training_title) LIKE ?
+        """, (f'%{training_title.split()[0].lower()}%',)).fetchone()[0]
+
+        compliance_rate = (training_count / eligible * 100) if eligible else 0
+
+        overdue = conn.execute("""
+            SELECT COUNT(DISTINCT t.employee_id)
+            FROM trainings t
+            JOIN employees e ON e.id = t.employee_id
+            WHERE t.deleted_at IS NULL
+              AND e.deleted_at IS NULL
+              AND (e.end_date IS NULL OR date(e.end_date) > date('now'))
+              AND lower(t.training_title) LIKE ?
+              AND date(t.next_due_date) < date('now')
+        """, (f'%{training_title.split()[0].lower()}%',)).fetchone()[0]
+
+        # Only add to compliance data if trained staff count > 0
+        if training_count > 0 or compliance_rate > 0:
+            compliance_data.append({
+                'Training': training_title,
+                'Trained Staff': training_count,
+                'Compliance Rate': compliance_rate,
+                'Overdue': overdue
+            })
+
+    # Get venue data
+    venue_data = conn.execute("""
+        SELECT t.training_venue,
+               COUNT(*) as sessions,
+               COUNT(DISTINCT t.employee_id) as unique_staff
+        FROM trainings t
+        JOIN employees e ON e.id = t.employee_id
+        WHERE t.deleted_at IS NULL
+          AND e.deleted_at IS NULL
+          AND strftime('%Y', t.training_date) = ?
+          AND t.training_venue IS NOT NULL
+          AND t.training_venue != ''
+        GROUP BY t.training_venue
+        HAVING sessions > 0 AND unique_staff > 0
+        ORDER BY sessions DESC
+    """, (str(report_year),)).fetchall()
+    venue_df = pd.DataFrame(venue_data, columns=['Venue', 'Sessions', 'Unique Staff']) if venue_data else pd.DataFrame()
+    # Filter out rows with zero or negative values
+    if not venue_df.empty:
+        venue_df = venue_df[(venue_df['Sessions'] > 0) & (venue_df['Unique Staff'] > 0)]
+
+    # Get regional data - using region from trainings table and filtering by year
+    region_data = conn.execute("""
+        SELECT COALESCE(t.region, e.region, 'Unknown') as region_name,
+               COUNT(DISTINCT e.id) as total_staff,
+               COUNT(DISTINCT CASE WHEN t.id IS NOT NULL THEN e.id END) as trained_staff,
+               COUNT(CASE WHEN strftime('%Y', t.training_date) = ? THEN t.id END) as total_trainings
+        FROM employees e
+        LEFT JOIN trainings t ON e.id = t.employee_id
+                              AND t.deleted_at IS NULL
+                              AND strftime('%Y', t.training_date) = ?
+        WHERE e.deleted_at IS NULL
+          AND (e.end_date IS NULL OR date(e.end_date) > date('now'))
+        GROUP BY region_name
+        HAVING total_trainings > 0
+        ORDER BY total_trainings DESC
+    """, (str(report_year), str(report_year))).fetchall()
+    region_df = pd.DataFrame(region_data, columns=['Region', 'Total Staff', 'Trained Staff', 'Total Trainings']) if region_data else pd.DataFrame()
+    # Filter out rows with zero or negative values
+    if not region_df.empty:
+        region_df = region_df[(region_df['Total Staff'] > 0) & (region_df['Total Trainings'] > 0)]
+
+    # Get monthly data
+    monthly_data = conn.execute("""
+        SELECT strftime('%m', t.training_date) as month,
+               COUNT(*) as trainings,
+               COUNT(DISTINCT t.employee_id) as unique_staff
+        FROM trainings t
+        JOIN employees e ON e.id = t.employee_id
+        WHERE t.deleted_at IS NULL
+          AND e.deleted_at IS NULL
+          AND strftime('%Y', t.training_date) = ?
+        GROUP BY month
+        HAVING trainings > 0
+        ORDER BY month
+    """, (str(report_year),)).fetchall()
+    month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    monthly_df = pd.DataFrame(monthly_data, columns=['Month', 'Trainings', 'Unique Staff']) if monthly_data else pd.DataFrame()
+    if not monthly_df.empty:
+        # Filter out rows with zero or negative values
+        monthly_df = monthly_df[(monthly_df['Trainings'] > 0) & (monthly_df['Unique Staff'] > 0)]
+        monthly_df['Month Name'] = monthly_df['Month'].apply(lambda x: month_names[int(x)-1])
+
+    # Get pending staff details
+    yet_to_train = staff_yet_to_be_trained(conn, filters)
+    yet_to_train_df = pd.DataFrame(yet_to_train) if yet_to_train else pd.DataFrame()
+
+    # Get department data - training by department
+    dept_data = conn.execute("""
+        SELECT e.department,
+               COUNT(DISTINCT e.id) as total_staff,
+               COUNT(DISTINCT CASE WHEN t.id IS NOT NULL THEN e.id END) as trained_staff,
+               COUNT(CASE WHEN strftime('%Y', t.training_date) = ? THEN t.id END) as total_trainings
+        FROM employees e
+        LEFT JOIN trainings t ON e.id = t.employee_id
+                              AND t.deleted_at IS NULL
+                              AND strftime('%Y', t.training_date) = ?
+        WHERE e.deleted_at IS NULL
+          AND (e.end_date IS NULL OR date(e.end_date) > date('now'))
+          AND e.department IS NOT NULL
+          AND e.department != ''
+        GROUP BY e.department
+        HAVING total_trainings > 0
+        ORDER BY total_trainings DESC
+    """, (str(report_year), str(report_year))).fetchall()
+    dept_df = pd.DataFrame(dept_data, columns=['Department', 'Total Staff', 'Trained Staff', 'Total Trainings']) if dept_data else pd.DataFrame()
+    # Filter out rows with zero or negative values
+    if not dept_df.empty:
+        dept_df = dept_df[(dept_df['Total Staff'] > 0) & (dept_df['Total Trainings'] > 0)]
+        dept_df['Coverage Rate'] = (dept_df['Trained Staff'] / dept_df['Total Staff'] * 100).round(1)
+
+    return {
+        'year': report_year,
+        'summary': {
+            'total_trainings': total_trainings,
+            'total_staff': total_staff,  # Master + Hires + Leavers
+            'active_staff': active_staff,  # Master + Hires - Leavers
+            'staff_trained': staff_trained,  # Active staff trained
+            'stores_trained': stores_trained,
+            'pending_trainings': pending_count,
+        },
+        'training_frequency': freq_df,
+        'stores_coverage': {
+            'total': total_stores_count,
+            'trained': stores_trained,
+            'pending': stores_pending,
+            'trained_pct': (stores_trained/total_stores_count*100 if total_stores_count else 0),
+            'pending_pct': (stores_pending/total_stores_count*100 if total_stores_count else 0),
+        },
+        'staff_participation': {
+            'eligible': eligible,
+            'participated': participated,
+            'not_participated': not_participated,
+            'participation_rate': (participated/eligible*100 if eligible else 0),
+        },
+        'food_safety': {
+            'required': food_report['required'],
+            'tested': food_report['tested'],
+            'never_tested': food_report['required'] - food_report['tested'],
+            'tested_pct': (food_report['tested']/food_report['required']*100 if food_report['required'] else 0),
+            'due_count': food_report['due_count'],
+            'due_details': food_report['due_details'],
+        },
+        'compliance': compliance_data,
+        'venue_analysis': venue_df,
+        'regional_coverage': region_df,
+        'department_coverage': dept_df,
+        'monthly_trends': monthly_df,
+        'staff_yet_to_train': yet_to_train_df,
+    }
+
+with col_dl1:
+    if st.button("📊 Generate PowerPoint", use_container_width=True, type="primary"):
+        with st.spinner("Generating PowerPoint presentation..."):
+            report_data = prepare_report_data()
+            pptx_bytes = create_pptx_report(report_data)
+            st.download_button(
+                "⬇️ Download PowerPoint",
+                data=pptx_bytes,
+                file_name=f"training_report_{report_year}.pptx",
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                use_container_width=True
+            )
+
+with col_dl2:
+    if st.button("📄 Generate Word Document", use_container_width=True, type="primary"):
+        with st.spinner("Generating Word document..."):
+            report_data = prepare_report_data()
+            word_bytes = create_word_report(report_data)
+            st.download_button(
+                "⬇️ Download Word Document",
+                data=word_bytes,
+                file_name=f"training_report_{report_year}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True
+            )
+
+with col_dl3:
+    if st.button("📕 Generate PDF", use_container_width=True, type="primary"):
+        with st.spinner("Generating PDF report..."):
+            report_data = prepare_report_data()
+            pdf_bytes = create_pdf_report(report_data)
+            st.download_button(
+                "⬇️ Download PDF",
+                data=pdf_bytes,
+                file_name=f"training_report_{report_year}.pdf",
+                mime="application/pdf",
+                use_container_width=True
+            )
+
+st.markdown("---")
+
+# Create expandable sections for each report
+with st.expander("🎯 Training Frequency Report", expanded=False):
+    st.subheader(f"Training Sessions Held in {report_year}")
+    freq_data = training_frequency_report(conn, year=report_year, filters=filters)
+
+    if freq_data:
+        freq_df = pd.DataFrame(freq_data, columns=[
+            "Training Title", "Times Held", "All Dates", "First Date", "Last Date"
+        ])
+
+        st.dataframe(freq_df, use_container_width=True)
+
+        # Chart
+        fig_freq = px.bar(freq_df, x="Training Title", y="Times Held",
+                         title=f"Training Frequency in {report_year}",
+                         text="Times Held")
+        fig_freq.update_layout(margin=dict(l=30,r=10,b=180,t=60), xaxis_tickangle=-45)
+        st.plotly_chart(fig_freq, use_container_width=True)
+
+        st.download_button(
+            "Download Training Frequency Report (Excel)",
+            data=to_excel_bytes({"Training Frequency": freq_df}),
+            file_name=f"training_frequency_{report_year}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    else:
+        st.info(f"No training data found for {report_year}.")
+
+with st.expander("🏪 Stores Training Coverage", expanded=False):
+    st.subheader(f"Store Participation in {report_year}")
+
+    stores_trained = stores_trained_count(conn, year=report_year, filters=filters)
+    stores_pending = stores_pending_training(conn, year=report_year, filters=filters)
+    total_stores_count = stores_trained + stores_pending
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Stores", total_stores_count)
+    with col2:
+        st.metric("Stores Trained", stores_trained,
+                 delta=f"{(stores_trained/total_stores_count*100 if total_stores_count else 0):.1f}%")
+    with col3:
+        st.metric("Stores Pending", stores_pending,
+                 delta=f"{(stores_pending/total_stores_count*100 if total_stores_count else 0):.1f}%",
+                 delta_color="inverse")
+
+    # Pie chart
+    store_data = pd.DataFrame({
+        "Status": ["Trained", "Pending"],
+        "Count": [stores_trained, stores_pending]
+    })
+    fig_stores = px.pie(store_data, names="Status", values="Count",
+                       title=f"Store Training Coverage {report_year}",
+                       color_discrete_map={"Trained": "#00CC96", "Pending": "#EF553B"})
+    st.plotly_chart(fig_stores, use_container_width=True)
+
+with st.expander("👥 Staff Participation Analysis", expanded=False):
+    st.subheader(f"Staff Training Participation in {report_year}")
+
+    eligible = staff_eligible_for_training(conn, filters)
+    participated = staff_participated_in_training(conn, year=report_year, filters=filters)
+    not_participated = eligible - participated
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Eligible for Training", eligible)
+    with col2:
+        st.metric("Participated", participated,
+                 delta=f"{(participated/eligible*100 if eligible else 0):.1f}%")
+    with col3:
+        st.metric("Not Participated", not_participated,
+                 delta=f"{(not_participated/eligible*100 if eligible else 0):.1f}%",
+                 delta_color="inverse")
+    with col4:
+        participation_rate = (participated/eligible*100 if eligible else 0)
+        st.metric("Participation Rate", f"{participation_rate:.1f}%")
+
+    # Bar chart
+    participation_data = pd.DataFrame({
+        "Category": ["Participated", "Not Participated"],
+        "Count": [participated, not_participated]
+    })
+    fig_participation = px.bar(participation_data, x="Category", y="Count",
+                              title=f"Staff Participation Overview {report_year}",
+                              color="Category",
+                              color_discrete_map={"Participated": "#00CC96", "Not Participated": "#EF553B"})
+    st.plotly_chart(fig_participation, use_container_width=True)
+
+with st.expander("⏰ Pending Trainings & Staff Yet to be Trained", expanded=False):
+    st.subheader("Training Status and Pending Actions")
+
+    pending_count = trainings_pending_count(conn, filters)
+    yet_to_train = staff_yet_to_be_trained(conn, filters)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Trainings Pending (Due/Overdue)", pending_count)
+    with col2:
+        st.metric("Staff Yet to be Trained", len(yet_to_train))
+
+    if yet_to_train:
+        st.subheader("Staff Missing Required Trainings (Not on Probation)")
+        yet_df = pd.DataFrame(yet_to_train)
+        st.dataframe(yet_df, use_container_width=True, height=400)
+
+        st.download_button(
+            "Download Staff Yet to be Trained (Excel)",
+            data=to_excel_bytes({"Staff Yet to Train": yet_df}),
+            file_name="staff_yet_to_be_trained.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    else:
+        st.success("✅ All eligible staff have received required trainings!")
+
+with st.expander("🍽️ Food Handlers / Food Safety Detailed Report", expanded=True):
+    st.subheader("Food Safety Training Compliance Report")
+
+    food_report = food_handlers_report(conn, filters)
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Required to be Tested", food_report["required"])
+    with col2:
+        st.metric("Already Tested", food_report["tested"],
+                 delta=f"{(food_report['tested']/food_report['required']*100 if food_report['required'] else 0):.1f}%")
+    with col3:
+        never_tested = food_report["required"] - food_report["tested"]
+        st.metric("Never Tested", never_tested,
+                 delta=f"{(never_tested/food_report['required']*100 if food_report['required'] else 0):.1f}%",
+                 delta_color="inverse")
+    with col4:
+        st.metric("Due for Testing", food_report["due_count"])
+
+    # Detailed table of staff due for testing
+    if food_report["due_details"]:
+        st.subheader("Staff Due for Food Safety Testing (Next 30 Days or Overdue)")
+        due_df = pd.DataFrame(food_report["due_details"])
+
+        # Color code the status column
+        st.dataframe(due_df, use_container_width=True, height=400)
+
+        # Summary by status
+        status_summary = due_df.groupby("status").size().reset_index(name="Count")
+        fig_food = px.bar(status_summary, x="status", y="Count",
+                         title="Food Safety Testing Status Breakdown",
+                         color="status")
+        st.plotly_chart(fig_food, use_container_width=True)
+
+        st.download_button(
+            "Download Food Safety Report (Excel)",
+            data=to_excel_bytes({
+                "Food Safety Summary": pd.DataFrame([food_report]).drop(columns=["due_details"]),
+                "Due for Testing": due_df
+            }),
+            file_name=f"food_safety_report_{date.today().isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    else:
+        st.success("✅ All staff are up to date with Food Safety training!")
+
+with st.expander("🎯 Compliance Dashboard - All 7 Required Trainings", expanded=False):
+    st.subheader("Required Trainings Compliance Status")
+
+    # Get compliance data for all 7 required trainings
+    compliance_data = []
+
+    for training_title in REQUIRED_TRAININGS:
+        # Count employees with this training
+        training_count = conn.execute("""
+            SELECT COUNT(DISTINCT t.employee_id)
+            FROM trainings t
+            JOIN employees e ON e.id = t.employee_id
+            WHERE t.deleted_at IS NULL
+              AND e.deleted_at IS NULL
+              AND (e.end_date IS NULL OR date(e.end_date) > date('now'))
+              AND lower(t.training_title) LIKE ?
+        """, (f'%{training_title.split()[0].lower()}%',)).fetchone()[0]
+
+        eligible = staff_eligible_for_training(conn, filters)
+        compliance_rate = (training_count / eligible * 100) if eligible else 0
+
+        # Count overdue/due
+        overdue = conn.execute("""
+            SELECT COUNT(DISTINCT t.employee_id)
+            FROM trainings t
+            JOIN employees e ON e.id = t.employee_id
+            WHERE t.deleted_at IS NULL
+              AND e.deleted_at IS NULL
+              AND (e.end_date IS NULL OR date(e.end_date) > date('now'))
+              AND lower(t.training_title) LIKE ?
+              AND date(t.next_due_date) < date('now')
+        """, (f'%{training_title.split()[0].lower()}%',)).fetchone()[0]
+
+        compliance_data.append({
+            'Training': training_title,
+            'Trained Staff': training_count,
+            'Eligible Staff': eligible,
+            'Compliance Rate': f"{compliance_rate:.1f}%",
+            'Overdue': overdue
+        })
+
+    compliance_df = pd.DataFrame(compliance_data)
+    st.dataframe(compliance_df, use_container_width=True, height=300)
+
+    # Compliance chart
+    compliance_df['Compliance_Numeric'] = compliance_df['Compliance Rate'].str.rstrip('%').astype(float)
+    fig_compliance = px.bar(compliance_df, x='Training', y='Compliance_Numeric',
+                           title="Compliance Rate by Training Type",
+                           labels={'Compliance_Numeric': 'Compliance Rate (%)'},
+                           color='Compliance_Numeric',
+                           color_continuous_scale='RdYlGn',
+                           range_color=[0, 100])
+    fig_compliance.update_layout(margin=dict(l=30,r=10,b=200,t=60), xaxis_tickangle=-45)
+    st.plotly_chart(fig_compliance, use_container_width=True)
+
+    st.download_button(
+        "Download Compliance Report (Excel)",
+        data=to_excel_bytes({"Compliance Dashboard": compliance_df.drop(columns=['Compliance_Numeric'])}),
+        file_name=f"compliance_dashboard_{date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+
+with st.expander("📍 Training by Venue Analysis", expanded=False):
+    st.subheader(f"Training Venues in {report_year}")
+
+    venue_data = conn.execute("""
+        SELECT t.training_venue,
+               COUNT(*) as sessions,
+               COUNT(DISTINCT t.employee_id) as unique_staff,
+               COUNT(DISTINCT e.store) as unique_stores
+        FROM trainings t
+        JOIN employees e ON e.id = t.employee_id
+        WHERE t.deleted_at IS NULL
+          AND e.deleted_at IS NULL
+          AND strftime('%Y', t.training_date) = ?
+          AND t.training_venue IS NOT NULL
+          AND t.training_venue != ''
+        GROUP BY t.training_venue
+        ORDER BY sessions DESC
+    """, (str(report_year),)).fetchall()
+
+    if venue_data:
+        venue_df = pd.DataFrame(venue_data, columns=['Venue', 'Sessions Held', 'Unique Staff', 'Unique Stores'])
+        st.dataframe(venue_df, use_container_width=True)
+
+        # Venue chart
+        fig_venue = px.bar(venue_df, x='Venue', y='Sessions Held',
+                          title=f"Training Sessions by Venue ({report_year})",
+                          text='Sessions Held')
+        fig_venue.update_layout(margin=dict(l=30,r=10,b=180,t=60), xaxis_tickangle=-45)
+        st.plotly_chart(fig_venue, use_container_width=True)
+
+        st.download_button(
+            "Download Venue Analysis (Excel)",
+            data=to_excel_bytes({"Venue Analysis": venue_df}),
+            file_name=f"venue_analysis_{report_year}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    else:
+        st.info(f"No venue data available for {report_year}.")
+
+with st.expander("🌍 Regional Training Coverage", expanded=False):
+    st.subheader("Training Coverage by Region")
+
+    region_data = conn.execute("""
+        SELECT COALESCE(t.region, e.region, 'Unknown') as region_name,
+               COUNT(DISTINCT e.id) as total_staff,
+               COUNT(DISTINCT CASE WHEN t.id IS NOT NULL THEN e.id END) as trained_staff,
+               COUNT(CASE WHEN strftime('%Y', t.training_date) = ? THEN t.id END) as total_trainings
+        FROM employees e
+        LEFT JOIN trainings t ON e.id = t.employee_id
+                              AND t.deleted_at IS NULL
+                              AND strftime('%Y', t.training_date) = ?
+        WHERE e.deleted_at IS NULL
+          AND (e.end_date IS NULL OR date(e.end_date) > date('now'))
+        GROUP BY region_name
+        HAVING total_trainings > 0
+        ORDER BY total_trainings DESC
+    """, (str(report_year), str(report_year))).fetchall()
+
+    if region_data:
+        region_df = pd.DataFrame(region_data, columns=['Region', 'Total Staff', 'Trained Staff', 'Total Trainings'])
+        # Filter out rows with zero or negative values
+        region_df = region_df[(region_df['Total Staff'] > 0) & (region_df['Total Trainings'] > 0)]
+        region_df['Coverage Rate'] = (region_df['Trained Staff'] / region_df['Total Staff'] * 100).round(1)
+
+        st.dataframe(region_df, use_container_width=True)
+
+        # Regional coverage chart
+        fig_regional = px.bar(region_df, x='Region', y=['Trained Staff', 'Total Staff'],
+                             title="Regional Training Coverage",
+                             barmode='group')
+        fig_regional.update_layout(margin=dict(l=30,r=10,b=120,t=60), xaxis_tickangle=-45)
+        st.plotly_chart(fig_regional, use_container_width=True)
+
+        # Training by Region bar chart
+        fig_regional_trainings = px.bar(region_df.sort_values('Total Trainings', ascending=False),
+                                       x='Region', y='Total Trainings',
+                                       title="Total Trainings by Region",
+                                       text='Total Trainings')
+        fig_regional_trainings.update_layout(margin=dict(l=30,r=10,b=120,t=60), xaxis_tickangle=-45)
+        st.plotly_chart(fig_regional_trainings, use_container_width=True)
+
+        st.download_button(
+            "Download Regional Coverage (Excel)",
+            data=to_excel_bytes({"Regional Coverage": region_df}),
+            file_name="regional_coverage.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    else:
+        st.info("No regional data available.")
+
+with st.expander("💼 Position-Based Training Analysis", expanded=False):
+    st.subheader("Training by Employee Position")
+
+    position_data = conn.execute("""
+        SELECT e.position,
+               COUNT(DISTINCT e.id) as total_staff,
+               COUNT(DISTINCT CASE WHEN t.id IS NOT NULL THEN e.id END) as trained_staff,
+               COUNT(DISTINCT t.id) as total_trainings
+        FROM employees e
+        LEFT JOIN trainings t ON e.id = t.employee_id AND t.deleted_at IS NULL
+        WHERE e.deleted_at IS NULL
+          AND (e.end_date IS NULL OR date(e.end_date) > date('now'))
+          AND e.position IS NOT NULL
+          AND e.position != ''
+        GROUP BY e.position
+        ORDER BY total_staff DESC
+        LIMIT 20
+    """).fetchall()
+
+    if position_data:
+        position_df = pd.DataFrame(position_data, columns=['Position', 'Total Staff', 'Trained Staff', 'Total Trainings'])
+        position_df['Training per Staff'] = (position_df['Total Trainings'] / position_df['Total Staff']).round(2)
+
+        st.dataframe(position_df, use_container_width=True)
+
+        # Position chart
+        fig_position = px.bar(position_df.head(15), x='Position', y='Training per Staff',
+                             title="Top 15 Positions by Training per Staff",
+                             text='Training per Staff')
+        fig_position.update_layout(margin=dict(l=30,r=10,b=200,t=60), xaxis_tickangle=-65)
+        st.plotly_chart(fig_position, use_container_width=True)
+
+        st.download_button(
+            "Download Position Analysis (Excel)",
+            data=to_excel_bytes({"Position Analysis": position_df}),
+            file_name="position_analysis.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    else:
+        st.info("No position data available.")
+
+with st.expander("📅 Monthly Training Trends", expanded=False):
+    st.subheader(f"Monthly Training Activity in {report_year}")
+
+    monthly_data = conn.execute("""
+        SELECT strftime('%m', t.training_date) as month,
+               COUNT(*) as trainings,
+               COUNT(DISTINCT t.employee_id) as unique_staff,
+               COUNT(DISTINCT e.store) as unique_stores
+        FROM trainings t
+        JOIN employees e ON e.id = t.employee_id
+        WHERE t.deleted_at IS NULL
+          AND e.deleted_at IS NULL
+          AND strftime('%Y', t.training_date) = ?
+        GROUP BY month
+        ORDER BY month
+    """, (str(report_year),)).fetchall()
+
+    if monthly_data:
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        monthly_df = pd.DataFrame(monthly_data, columns=['Month', 'Trainings', 'Unique Staff', 'Unique Stores'])
+        monthly_df['Month Name'] = monthly_df['Month'].apply(lambda x: month_names[int(x)-1])
+
+        st.dataframe(monthly_df[['Month Name', 'Trainings', 'Unique Staff', 'Unique Stores']], use_container_width=True)
+
+        # Monthly trends chart
+        fig_monthly = px.line(monthly_df, x='Month Name', y=['Trainings', 'Unique Staff'],
+                             title=f"Monthly Training Trends ({report_year})",
+                             markers=True)
+        fig_monthly.update_layout(margin=dict(l=30,r=10,b=80,t=60))
+        st.plotly_chart(fig_monthly, use_container_width=True)
+
+        st.download_button(
+            "Download Monthly Trends (Excel)",
+            data=to_excel_bytes({"Monthly Trends": monthly_df[['Month Name', 'Trainings', 'Unique Staff', 'Unique Stores']]}),
+            file_name=f"monthly_trends_{report_year}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    else:
+        st.info(f"No monthly data available for {report_year}.")
+
+with st.expander("🏢 Department-Wise Pending Trainings", expanded=False):
+    st.subheader("Pending Trainings by Department")
+
+    # Get flags and organize by department
+    flags = employees_due_flags(conn, filters)
+
+    dept_pending = {}
+    for emp_id, status in flags.items():
+        if status.get("any_due_30", False) or status.get("any_overdue", False):
+            # Get employee department
+            emp = conn.execute("SELECT department FROM employees WHERE id=?", (emp_id,)).fetchone()
+            if emp and emp[0]:
+                dept = emp[0]
+                if dept not in dept_pending:
+                    dept_pending[dept] = {'due_30': 0, 'overdue': 0, 'missing': 0}
+
+                if status.get("any_overdue", False):
+                    dept_pending[dept]['overdue'] += 1
+                elif status.get("any_due_30", False):
+                    dept_pending[dept]['due_30'] += 1
+
+                if status.get("any_missing", False):
+                    dept_pending[dept]['missing'] += 1
+
+    if dept_pending:
+        pending_df = pd.DataFrame([
+            {'Department': dept, 'Due in 30 Days': data['due_30'], 'Overdue': data['overdue'], 'Missing Trainings': data['missing']}
+            for dept, data in dept_pending.items()
+        ]).sort_values('Overdue', ascending=False)
+
+        st.dataframe(pending_df, use_container_width=True)
+
+        # Pending trainings chart
+        fig_pending = px.bar(pending_df, x='Department', y=['Due in 30 Days', 'Overdue', 'Missing Trainings'],
+                            title="Pending Trainings by Department",
+                            barmode='stack')
+        fig_pending.update_layout(margin=dict(l=30,r=10,b=160,t=60), xaxis_tickangle=-45)
+        st.plotly_chart(fig_pending, use_container_width=True)
+
+        st.download_button(
+            "Download Department Pending Report (Excel)",
+            data=to_excel_bytes({"Department Pending": pending_df}),
+            file_name="department_pending_trainings.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    else:
+        st.success("✅ No pending trainings across all departments!")
+
+with st.expander("👋 Trained Employees Who Left", expanded=False):
+    st.subheader("Training ROI Analysis - Employees Who Left After Training")
+    st.caption("Shows employees who received training but have since left the company. Useful for understanding training ROI and retention patterns.")
+
+    left_data = trained_employees_who_left(conn, filters)
+
+    if left_data:
+        left_df = pd.DataFrame(left_data, columns=[
+            'ID', 'Name', 'Email', 'Department', 'Store', 'Position', 'Region',
+            'Start Date', 'End Date', 'Total Trainings', 'Training Titles',
+            'First Training', 'Last Training'
+        ])
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Employees Who Left After Training", len(left_df))
+        with col2:
+            total_trainings_lost = left_df['Total Trainings'].sum()
+            st.metric("Total Trainings Lost", int(total_trainings_lost))
+        with col3:
+            avg_trainings = left_df['Total Trainings'].mean()
+            st.metric("Avg Trainings per Leaver", f"{avg_trainings:.1f}")
+        with col4:
+            # Calculate retention period (days between first training and end date)
+            left_df['Start Date'] = pd.to_datetime(left_df['Start Date'], errors='coerce')
+            left_df['End Date'] = pd.to_datetime(left_df['End Date'], errors='coerce')
+            left_df['First Training'] = pd.to_datetime(left_df['First Training'], errors='coerce')
+            left_df['Retention Days'] = (left_df['End Date'] - left_df['First Training']).dt.days
+            avg_retention = left_df['Retention Days'].mean()
+            st.metric("Avg Retention After 1st Training", f"{avg_retention:.0f} days" if pd.notna(avg_retention) else "N/A")
+
+        st.dataframe(left_df, use_container_width=True, height=400)
+
+        # Breakdown by department
+        dept_breakdown = left_df.groupby('Department').agg({
+            'ID': 'count',
+            'Total Trainings': 'sum'
+        }).reset_index()
+        dept_breakdown.columns = ['Department', 'Employees Who Left', 'Total Trainings Lost']
+        dept_breakdown = dept_breakdown.sort_values('Employees Who Left', ascending=False)
+
+        st.subheader("Breakdown by Department")
+        fig_dept_left = px.bar(dept_breakdown, x='Department', y=['Employees Who Left', 'Total Trainings Lost'],
+                              title="Trained Employees Who Left - By Department",
+                              barmode='group')
+        fig_dept_left.update_layout(margin=dict(l=30,r=10,b=160,t=60), xaxis_tickangle=-45)
+        st.plotly_chart(fig_dept_left, use_container_width=True)
+
+        st.download_button(
+            "Download Trained Employees Who Left (Excel)",
+            data=to_excel_bytes({
+                "Employees Who Left": left_df,
+                "Department Breakdown": dept_breakdown
+            }),
+            file_name="trained_employees_who_left.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    else:
+        st.success("✅ No trained employees have left the company!")
 
 st.header("📈 Interactive Analytics")
 

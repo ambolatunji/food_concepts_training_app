@@ -24,6 +24,42 @@ def normalize_str(x) -> str:
     return s
 
 
+def normalize_name(name: str) -> str:
+    """
+    Normalize person names to Title Case for consistent storage/display.
+    Examples:
+      - "OLATUNJI" -> "Olatunji"
+      - "olatunji dare" -> "Olatunji Dare"
+      - "OlAtUnJI" -> "Olatunji"
+    """
+    if not name:
+        return ""
+
+    # First normalize the string (trim, clean)
+    n = normalize_str(name)
+
+    # Apply title case
+    return n.title()
+
+
+def normalize_field(field: str) -> str:
+    """
+    Normalize general text fields (departments, stores, positions) to Title Case.
+    Examples:
+      - "OPERATIONS" -> "Operations"
+      - "lagos store 1" -> "Lagos Store 1"
+      - "FOOD SAFETY" -> "Food Safety"
+    """
+    if not field:
+        return ""
+
+    # First normalize the string (trim, clean)
+    f = normalize_str(field)
+
+    # Apply title case
+    return f.title()
+
+
 def unique_key(name, email, store, department):
     name = normalize_str(name).lower()
     email = normalize_str(email).lower()
@@ -87,10 +123,59 @@ REGION_SYNONYMS = {
     "south-east": "South-East",
 }
 
+# Canonical training title mappings
+TRAINING_TITLE_CANONICAL = {
+    "food safety training": "Food Safety Training",
+    "food handlers training": "Food Safety Training",
+    "food handler training": "Food Safety Training",
+    "fire safety training": "Fire Safety Training",
+    "fire fighting training": "Fire Safety Training",
+    "first aid training": "First Aid Training",
+    "pest control training": "Pest Control Training",
+    "occupational health and safety training": "Occupational Health and Safety Training",
+    "occupational health & safety training": "Occupational Health and Safety Training",
+    "ohs training": "Occupational Health and Safety Training",
+    "6s training": "6S Training",
+    "water treatment plant training": "Water Treatment Plant Training",
+    "water treatment training": "Water Treatment Plant Training",
+}
+
 def canonicalize(value:str, synonyms:dict) -> str:
     if not value: return value
     key = normalize_str(value).lower()
     return synonyms.get(key, value)
+
+def normalize_training_title(title:str) -> str:
+    """
+    Normalize training titles to canonical forms:
+    - Lowercase and trim
+    - Remove special characters (& becomes 'and')
+    - Map to canonical title if recognized
+    """
+    if not title:
+        return ""
+
+    # Normalize basic string (trim, collapse whitespace)
+    t = normalize_str(title)
+
+    # Replace & with 'and'
+    t = t.replace("&", "and")
+
+    # Remove extra punctuation but keep spaces
+    t = re.sub(r"[^\w\s]", "", t)
+
+    # Collapse multiple spaces
+    t = re.sub(r"\s+", " ", t.strip())
+
+    # Try to match to canonical form
+    key = t.lower()
+    canonical = TRAINING_TITLE_CANONICAL.get(key, None)
+
+    if canonical:
+        return canonical
+
+    # If not found in map, return title case version
+    return t.title()
 
 def file_safe_name(name:str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name or "")

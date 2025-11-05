@@ -1,0 +1,543 @@
+"""
+Report Generation Module for Training App
+Generates PowerPoint, Word, and PDF reports
+"""
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN
+from pptx.dml.color import RGBColor
+from docx import Document
+from docx.shared import Inches as DocxInches, Pt as DocxPt, RGBColor as DocxRGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+from reportlab.lib.units import inch
+from datetime import date
+import io
+import pandas as pd
+
+
+def create_pptx_report(report_data: dict) -> bytes:
+    """
+    Creates a PowerPoint presentation from comprehensive report data.
+
+    Args:
+        report_data: Dictionary containing all report sections
+
+    Returns:
+        bytes: PowerPoint file as bytes
+    """
+    prs = Presentation()
+    prs.slide_width = Inches(10)
+    prs.slide_height = Inches(7.5)
+
+    # Title Slide
+    title_slide = prs.slides.add_slide(prs.slide_layouts[0])
+    title = title_slide.shapes.title
+    subtitle = title_slide.placeholders[1]
+
+    title.text = "Food Concepts Training Report"
+    subtitle.text = f"Comprehensive Training Analytics\nGenerated: {date.today().strftime('%B %d, %Y')}"
+
+    # Apply styling to title
+    title.text_frame.paragraphs[0].font.size = Pt(44)
+    title.text_frame.paragraphs[0].font.bold = True
+    title.text_frame.paragraphs[0].font.color.rgb = RGBColor(0, 51, 102)
+
+    # Executive Summary Slide
+    summary_slide = prs.slides.add_slide(prs.slide_layouts[1])
+    summary_slide.shapes.title.text = "Executive Summary"
+
+    body = summary_slide.placeholders[1].text_frame
+    body.clear()
+
+    summary_data = report_data.get('summary', {})
+    p = body.add_paragraph()
+    p.text = f"Report Year: {report_data.get('year', date.today().year)}"
+    p.font.size = Pt(18)
+    p.font.bold = True
+
+    body.add_paragraph()
+    metrics = [
+        f"📊 Total Trainings: {summary_data.get('total_trainings', 0)}",
+        f"👥 Total Staff: {summary_data.get('total_staff', 0)}",
+        f"✅ Staff Trained: {summary_data.get('staff_trained', 0)}",
+        f"🏪 Stores Trained: {summary_data.get('stores_trained', 0)}",
+        f"⏰ Pending Trainings: {summary_data.get('pending_trainings', 0)}",
+    ]
+
+    for metric in metrics:
+        p = body.add_paragraph()
+        p.text = metric
+        p.level = 0
+        p.font.size = Pt(16)
+
+    # Training Frequency Slide
+    if 'training_frequency' in report_data and not report_data['training_frequency'].empty:
+        freq_slide = prs.slides.add_slide(prs.slide_layouts[5])
+        freq_slide.shapes.title.text = "Training Frequency"
+
+        # Add table
+        freq_df = report_data['training_frequency']
+        rows, cols = len(freq_df) + 1, 3  # Header + data rows, 3 columns
+
+        left = Inches(0.5)
+        top = Inches(2)
+        width = Inches(9)
+        height = Inches(4.5)
+
+        table = freq_slide.shapes.add_table(rows, cols, left, top, width, height).table
+
+        # Set column headers
+        table.cell(0, 0).text = "Training Title"
+        table.cell(0, 1).text = "Times Held"
+        table.cell(0, 2).text = "Date Range"
+
+        # Style header row
+        for col in range(cols):
+            cell = table.cell(0, col)
+            cell.fill.solid()
+            cell.fill.fore_color.rgb = RGBColor(0, 51, 102)
+            cell.text_frame.paragraphs[0].font.color.rgb = RGBColor(255, 255, 255)
+            cell.text_frame.paragraphs[0].font.bold = True
+            cell.text_frame.paragraphs[0].font.size = Pt(12)
+
+        # Fill data
+        for idx, row_data in enumerate(freq_df.itertuples(), start=1):
+            table.cell(idx, 0).text = str(row_data[1])  # Training Title
+            table.cell(idx, 1).text = str(row_data[2])  # Times Held
+            date_range = f"{row_data[4]} to {row_data[5]}" if len(row_data) > 5 else ""
+            table.cell(idx, 2).text = date_range
+
+            for col in range(cols):
+                table.cell(idx, col).text_frame.paragraphs[0].font.size = Pt(10)
+
+    # Stores Coverage Slide
+    if 'stores_coverage' in report_data:
+        stores_slide = prs.slides.add_slide(prs.slide_layouts[1])
+        stores_slide.shapes.title.text = "Stores Training Coverage"
+
+        body = stores_slide.placeholders[1].text_frame
+        body.clear()
+
+        stores_data = report_data['stores_coverage']
+
+        p = body.add_paragraph()
+        p.text = f"Total Stores: {stores_data.get('total', 0)}"
+        p.font.size = Pt(20)
+        p.font.bold = True
+
+        body.add_paragraph()
+
+        p = body.add_paragraph()
+        p.text = f"✅ Stores Trained: {stores_data.get('trained', 0)} ({stores_data.get('trained_pct', 0):.1f}%)"
+        p.font.size = Pt(18)
+        p.font.color.rgb = RGBColor(0, 128, 0)
+
+        p = body.add_paragraph()
+        p.text = f"⏳ Stores Pending: {stores_data.get('pending', 0)} ({stores_data.get('pending_pct', 0):.1f}%)"
+        p.font.size = Pt(18)
+        p.font.color.rgb = RGBColor(255, 69, 0)
+
+    # Staff Participation Slide
+    if 'staff_participation' in report_data:
+        staff_slide = prs.slides.add_slide(prs.slide_layouts[1])
+        staff_slide.shapes.title.text = "Staff Participation Analysis"
+
+        body = staff_slide.placeholders[1].text_frame
+        body.clear()
+
+        staff_data = report_data['staff_participation']
+
+        metrics = [
+            (f"Total Eligible Staff: {staff_data.get('eligible', 0)}", 20, False),
+            (f"Participated: {staff_data.get('participated', 0)} ({staff_data.get('participation_rate', 0):.1f}%)", 18, True),
+            (f"Not Participated: {staff_data.get('not_participated', 0)}", 18, False),
+        ]
+
+        for text, size, bold in metrics:
+            p = body.add_paragraph()
+            p.text = text
+            p.font.size = Pt(size)
+            p.font.bold = bold
+            body.add_paragraph()
+
+    # Food Safety Report Slide
+    if 'food_safety' in report_data:
+        food_slide = prs.slides.add_slide(prs.slide_layouts[1])
+        food_slide.shapes.title.text = "Food Safety Compliance"
+
+        body = food_slide.placeholders[1].text_frame
+        body.clear()
+
+        food_data = report_data['food_safety']
+
+        p = body.add_paragraph()
+        p.text = "Food Handlers / Food Safety Training Status"
+        p.font.size = Pt(18)
+        p.font.bold = True
+
+        body.add_paragraph()
+
+        metrics = [
+            f"Required to be Tested: {food_data.get('required', 0)}",
+            f"Already Tested: {food_data.get('tested', 0)} ({food_data.get('tested_pct', 0):.1f}%)",
+            f"Never Tested: {food_data.get('never_tested', 0)}",
+            f"Due for Testing: {food_data.get('due_count', 0)}",
+        ]
+
+        for metric in metrics:
+            p = body.add_paragraph()
+            p.text = metric
+            p.font.size = Pt(16)
+
+    # Save to bytes
+    bio = io.BytesIO()
+    prs.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+
+def create_word_report(report_data: dict) -> bytes:
+    """
+    Creates a Word document from comprehensive report data.
+
+    Args:
+        report_data: Dictionary containing all report sections
+
+    Returns:
+        bytes: Word document as bytes
+    """
+    doc = Document()
+
+    # Title
+    title = doc.add_heading('Food Concepts Training Report', 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    subtitle = doc.add_paragraph(f'Comprehensive Training Analytics\nGenerated: {date.today().strftime("%B %d, %Y")}')
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_page_break()
+
+    # Executive Summary
+    doc.add_heading('Executive Summary', 1)
+
+    summary_data = report_data.get('summary', {})
+    doc.add_paragraph(f"Report Year: {report_data.get('year', date.today().year)}")
+
+    summary_table = doc.add_table(rows=6, cols=2)
+    summary_table.style = 'Light Grid Accent 1'
+
+    metrics = [
+        ('Total Trainings', summary_data.get('total_trainings', 0)),
+        ('Total Staff', summary_data.get('total_staff', 0)),
+        ('Staff Trained', summary_data.get('staff_trained', 0)),
+        ('Stores Trained', summary_data.get('stores_trained', 0)),
+        ('Pending Trainings', summary_data.get('pending_trainings', 0)),
+    ]
+
+    for idx, (label, value) in enumerate(metrics):
+        summary_table.rows[idx].cells[0].text = label
+        summary_table.rows[idx].cells[1].text = str(value)
+
+    doc.add_page_break()
+
+    # Training Frequency
+    if 'training_frequency' in report_data and not report_data['training_frequency'].empty:
+        doc.add_heading('Training Frequency', 1)
+
+        freq_df = report_data['training_frequency']
+
+        freq_table = doc.add_table(rows=len(freq_df) + 1, cols=4)
+        freq_table.style = 'Light Grid Accent 1'
+
+        # Headers
+        headers = ['Training Title', 'Times Held', 'First Date', 'Last Date']
+        for idx, header in enumerate(headers):
+            freq_table.rows[0].cells[idx].text = header
+
+        # Data
+        for row_idx, row_data in enumerate(freq_df.itertuples(), start=1):
+            freq_table.rows[row_idx].cells[0].text = str(row_data[1])
+            freq_table.rows[row_idx].cells[1].text = str(row_data[2])
+            freq_table.rows[row_idx].cells[2].text = str(row_data[4]) if len(row_data) > 4 else ""
+            freq_table.rows[row_idx].cells[3].text = str(row_data[5]) if len(row_data) > 5 else ""
+
+        doc.add_page_break()
+
+    # Stores Coverage
+    if 'stores_coverage' in report_data:
+        doc.add_heading('Stores Training Coverage', 1)
+
+        stores_data = report_data['stores_coverage']
+
+        stores_table = doc.add_table(rows=3, cols=2)
+        stores_table.style = 'Light Grid Accent 1'
+
+        stores_table.rows[0].cells[0].text = 'Total Stores'
+        stores_table.rows[0].cells[1].text = str(stores_data.get('total', 0))
+
+        stores_table.rows[1].cells[0].text = 'Stores Trained'
+        stores_table.rows[1].cells[1].text = f"{stores_data.get('trained', 0)} ({stores_data.get('trained_pct', 0):.1f}%)"
+
+        stores_table.rows[2].cells[0].text = 'Stores Pending'
+        stores_table.rows[2].cells[1].text = f"{stores_data.get('pending', 0)} ({stores_data.get('pending_pct', 0):.1f}%)"
+
+        doc.add_page_break()
+
+    # Staff Participation
+    if 'staff_participation' in report_data:
+        doc.add_heading('Staff Participation Analysis', 1)
+
+        staff_data = report_data['staff_participation']
+
+        staff_table = doc.add_table(rows=4, cols=2)
+        staff_table.style = 'Light Grid Accent 1'
+
+        staff_table.rows[0].cells[0].text = 'Eligible Staff'
+        staff_table.rows[0].cells[1].text = str(staff_data.get('eligible', 0))
+
+        staff_table.rows[1].cells[0].text = 'Participated'
+        staff_table.rows[1].cells[1].text = f"{staff_data.get('participated', 0)} ({staff_data.get('participation_rate', 0):.1f}%)"
+
+        staff_table.rows[2].cells[0].text = 'Not Participated'
+        staff_table.rows[2].cells[1].text = str(staff_data.get('not_participated', 0))
+
+        staff_table.rows[3].cells[0].text = 'Participation Rate'
+        staff_table.rows[3].cells[1].text = f"{staff_data.get('participation_rate', 0):.1f}%"
+
+        doc.add_page_break()
+
+    # Food Safety Report
+    if 'food_safety' in report_data:
+        doc.add_heading('Food Safety Compliance Report', 1)
+
+        food_data = report_data['food_safety']
+
+        food_table = doc.add_table(rows=4, cols=2)
+        food_table.style = 'Light Grid Accent 1'
+
+        food_table.rows[0].cells[0].text = 'Required to be Tested'
+        food_table.rows[0].cells[1].text = str(food_data.get('required', 0))
+
+        food_table.rows[1].cells[0].text = 'Already Tested'
+        food_table.rows[1].cells[1].text = f"{food_data.get('tested', 0)} ({food_data.get('tested_pct', 0):.1f}%)"
+
+        food_table.rows[2].cells[0].text = 'Never Tested'
+        food_table.rows[2].cells[1].text = str(food_data.get('never_tested', 0))
+
+        food_table.rows[3].cells[0].text = 'Due for Testing'
+        food_table.rows[3].cells[1].text = str(food_data.get('due_count', 0))
+
+        if food_data.get('due_details'):
+            doc.add_paragraph()
+            doc.add_heading('Staff Due for Testing', 2)
+
+            due_df = pd.DataFrame(food_data['due_details'])
+
+            if len(due_df) > 0:
+                due_table = doc.add_table(rows=len(due_df) + 1, cols=4)
+                due_table.style = 'Light Grid Accent 1'
+
+                # Headers
+                due_table.rows[0].cells[0].text = 'Name'
+                due_table.rows[0].cells[1].text = 'Department'
+                due_table.rows[0].cells[2].text = 'Due Date'
+                due_table.rows[0].cells[3].text = 'Status'
+
+                # Data
+                for row_idx, row_data in enumerate(due_df.itertuples(), start=1):
+                    due_table.rows[row_idx].cells[0].text = str(row_data.name)
+                    due_table.rows[row_idx].cells[1].text = str(row_data.department)
+                    due_table.rows[row_idx].cells[2].text = str(row_data.due_date)
+                    due_table.rows[row_idx].cells[3].text = str(row_data.status)
+
+    # Save to bytes
+    bio = io.BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+
+def create_pdf_report(report_data: dict) -> bytes:
+    """
+    Creates a PDF report from comprehensive report data.
+
+    Args:
+        report_data: Dictionary containing all report sections
+
+    Returns:
+        bytes: PDF file as bytes
+    """
+    bio = io.BytesIO()
+    doc = SimpleDocTemplate(bio, pagesize=letter)
+
+    # Container for elements
+    elements = []
+
+    # Styles
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=24,
+        textColor=colors.HexColor('#003366'),
+        spaceAfter=30,
+        alignment=1  # Center
+    )
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontSize=16,
+        textColor=colors.HexColor('#003366'),
+        spaceAfter=12
+    )
+
+    # Title
+    elements.append(Paragraph("Food Concepts Training Report", title_style))
+    elements.append(Paragraph(f"Comprehensive Training Analytics<br/>Generated: {date.today().strftime('%B %d, %Y')}", styles['Normal']))
+    elements.append(Spacer(1, 0.3*inch))
+
+    # Executive Summary
+    elements.append(Paragraph("Executive Summary", heading_style))
+
+    summary_data = report_data.get('summary', {})
+    summary_list = [
+        ['Metric', 'Value'],
+        ['Report Year', str(report_data.get('year', date.today().year))],
+        ['Total Trainings', str(summary_data.get('total_trainings', 0))],
+        ['Total Staff', str(summary_data.get('total_staff', 0))],
+        ['Staff Trained', str(summary_data.get('staff_trained', 0))],
+        ['Stores Trained', str(summary_data.get('stores_trained', 0))],
+        ['Pending Trainings', str(summary_data.get('pending_trainings', 0))],
+    ]
+
+    summary_table = Table(summary_list, colWidths=[3*inch, 2*inch])
+    summary_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#003366')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+    ]))
+    elements.append(summary_table)
+    elements.append(PageBreak())
+
+    # Training Frequency
+    if 'training_frequency' in report_data and report_data['training_frequency']:
+        elements.append(Paragraph("Training Frequency", heading_style))
+
+        freq_df = report_data['training_frequency']
+        freq_list = [['Training Title', 'Times Held', 'First Date', 'Last Date']]
+
+        for row in freq_df.itertuples():
+            freq_list.append([
+                str(row[1]),
+                str(row[2]),
+                str(row[4]) if len(row) > 4 else "",
+                str(row[5]) if len(row) > 5 else ""
+            ])
+
+        freq_table = Table(freq_list, colWidths=[2.5*inch, 1*inch, 1.5*inch, 1.5*inch])
+        freq_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#003366')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('FONTSIZE', (0, 1), (-1, -1), 8),
+        ]))
+        elements.append(freq_table)
+        elements.append(PageBreak())
+
+    # Stores Coverage
+    if 'stores_coverage' in report_data:
+        elements.append(Paragraph("Stores Training Coverage", heading_style))
+
+        stores_data = report_data['stores_coverage']
+        stores_list = [
+            ['Metric', 'Value'],
+            ['Total Stores', str(stores_data.get('total', 0))],
+            ['Stores Trained', f"{stores_data.get('trained', 0)} ({stores_data.get('trained_pct', 0):.1f}%)"],
+            ['Stores Pending', f"{stores_data.get('pending', 0)} ({stores_data.get('pending_pct', 0):.1f}%)"],
+        ]
+
+        stores_table = Table(stores_list, colWidths=[3*inch, 2*inch])
+        stores_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#003366')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ]))
+        elements.append(stores_table)
+        elements.append(Spacer(1, 0.3*inch))
+
+    # Staff Participation
+    if 'staff_participation' in report_data:
+        elements.append(Paragraph("Staff Participation Analysis", heading_style))
+
+        staff_data = report_data['staff_participation']
+        staff_list = [
+            ['Metric', 'Value'],
+            ['Eligible Staff', str(staff_data.get('eligible', 0))],
+            ['Participated', f"{staff_data.get('participated', 0)} ({staff_data.get('participation_rate', 0):.1f}%)"],
+            ['Not Participated', str(staff_data.get('not_participated', 0))],
+            ['Participation Rate', f"{staff_data.get('participation_rate', 0):.1f}%"],
+        ]
+
+        staff_table = Table(staff_list, colWidths=[3*inch, 2*inch])
+        staff_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#003366')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ]))
+        elements.append(staff_table)
+        elements.append(PageBreak())
+
+    # Food Safety Report
+    if 'food_safety' in report_data:
+        elements.append(Paragraph("Food Safety Compliance Report", heading_style))
+
+        food_data = report_data['food_safety']
+        food_list = [
+            ['Metric', 'Value'],
+            ['Required to be Tested', str(food_data.get('required', 0))],
+            ['Already Tested', f"{food_data.get('tested', 0)} ({food_data.get('tested_pct', 0):.1f}%)"],
+            ['Never Tested', str(food_data.get('never_tested', 0))],
+            ['Due for Testing', str(food_data.get('due_count', 0))],
+        ]
+
+        food_table = Table(food_list, colWidths=[3*inch, 2*inch])
+        food_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#003366')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ]))
+        elements.append(food_table)
+
+    # Build PDF
+    doc.build(elements)
+    bio.seek(0)
+    return bio.getvalue()
